@@ -1,6 +1,6 @@
 {
 	"id": "openclaw-taas-affinity",
-	"kind": "provider",
+	"providers": ["cloudsigma", "cloudsigma-staging"],
 	"configSchema": {
 		"type": "object",
 		"additionalProperties": false,

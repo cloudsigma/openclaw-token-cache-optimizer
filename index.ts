@@ -1,110 +1,69 @@
-/**
- * openclaw-taas-affinity
- *
- * OpenClaw provider plugin for CloudSigma TaaS session affinity.
- *
- * ## What it does
- *
- * CloudSigma TaaS routes each request to one of its upstream model slots
- * (OAuth tokens, Bedrock regions, Claude Code nodes). Its session-affinity
- * layer tries to keep multi-turn conversations on the same slot so prompt
- * caches are hot.
- *
- * Without this plugin, TaaS falls back to heuristic matching (tool-use-id
- * chains, structural inference) which only works well mid-conversation and
- * can't bind on the very first turn.
- *
- * This plugin injects two fields into every outbound request body:
- *
- *   body.metadata.session_id  — stable per OpenClaw session/workspace
- *   body.metadata.sticky_key  — same value; Anthropic substrate reads this
- *
- * TaaS reads `X-Session-Id` header OR `body.metadata.{session_id,sticky_key}`
- * and short-circuits all heuristics to confidence=1.0 from turn 1.
- *
- * ## Session ID derivation
- *
- * OpenClaw's plugin `wrapStreamFn` hook receives the session's `workspaceDir`
- * — a path that is stable across all turns of the same conversation and unique
- * per session (main, subagent, cron, etc).  We hash it with SHA-256 and take
- * the first 16 hex chars, then prefix with `oc:` to namespace it away from
- * other TaaS clients:
- *
- *   oc:a3f2c1b0e9d87654          ← main session
- *   oc:7f1d4c3a2e9b0856          ← subagent (different workspaceDir)
- *   oc:2a8e5f0c1d3b7946          ← next conversation (new session)
- *
- * ## Scope per session type
- *
- * | Session type          | ID scope                            |
- * |----------------------|-------------------------------------|
- * | Main agent           | Own stable ID (workspaceDir-based) |
- * | Spawned subagent     | Own ID (separate workspaceDir)     |
- * | Cron / isolated run  | Own ID (isolated workspace)        |
- * | New conversation     | New ID (workspace resets)          |
- * | Parallel sessions    | Separate IDs                        |
- *
- * ## TaaS compatibility
- *
- * Requires TaaS commit 61a9960+ ("feat: session affinity short-circuit via
- * X-Session-Id header", April 2026).
- *
- * ## Installation
- *
- * Drop this directory into ~/.openclaw/extensions/openclaw-taas-affinity/
- * and restart OpenClaw, or install from ClaWHub once published.
- *
- * No configuration required. The plugin only activates for the "cloudsigma"
- * provider and is a no-op for all other providers.
- */
-
 import { createHash } from "node:crypto"
+import os from "node:os"
 import path from "node:path"
 import type { OpenClawPluginApi, ProviderWrapStreamFnContext } from "openclaw/plugin-sdk"
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-/** The provider ID this plugin hooks into. Only CloudSigma requests are patched. */
-const TAAS_PROVIDER_ID = "cloudsigma"
-
 /**
- * Prefix for session IDs to distinguish OpenClaw sessions from other TaaS
- * clients (Claude Code, direct API users, etc.).
+ * openclaw-taas-affinity
+ *
+ * Injects a stable per-conversation session ID (oc:<sha256-prefix>) into every
+ * outbound request to CloudSigma TaaS providers so the session-affinity layer
+ * achieves confidence=1.0 from turn 1, maximising prompt-cache hit rates.
+ *
+ * ## How it works
+ *
+ * 1. Derives a stable session ID from the active agent's workspace directory path.
+ *    Different agents (different workspaces) get different IDs; subagents get their
+ *    own workspace-scoped ID.
+ *
+ * 2. Injects two fields into every outbound request body (never overwrites an
+ *    existing value so callers can still override):
+ *      body.metadata.session_id  — read by TaaS OpenAI-compat affinity path
+ *      body.metadata.sticky_key  — read by TaaS Anthropic affinity path
+ *
+ * ## Manifest wiring
+ *
+ * The plugin registers with id "taas-affinity-hook" (unique, avoids conflicting
+ * with the config-driven "cloudsigma" provider) and uses hookAliases to tell
+ * matchesProviderId that this plugin handles cloudsigma and cloudsigma-staging
+ * requests. The manifest providers array tells resolveOwningPluginIdsForProvider
+ * to load this plugin when those providers are active.
+ *
+ * ## workspaceDir
+ *
+ * The OpenClaw call site for wrapStreamFn does not currently populate
+ * ctx.workspaceDir, so we read it from the global plugin registry state
+ * (Symbol.for("openclaw.pluginRegistryState")) — the same source used
+ * internally by resolveProviderPluginsForHooks.
  */
+
 const SESSION_ID_PREFIX = "oc:"
 
-// ── Session ID derivation ─────────────────────────────────────────────────────
+// OpenClaw stores the active registry state (including workspaceDir) on globalThis
+// under this well-known symbol key.
+const PLUGIN_REGISTRY_STATE = Symbol.for("openclaw.pluginRegistryState")
 
-/**
- * Derive a stable, opaque session identifier from the session's workspace dir.
- *
- * The workspaceDir is:
- * - Stable: same path for every turn in the same OpenClaw session.
- * - Unique: each session (main, subagent, cron) gets a distinct path.
- * - Resets: a new conversation (/new, /reset) gets a new workspace dir.
- *
- * We SHA-256 hash the normalised path and take 16 hex chars (64 bits of
- * collision resistance — more than sufficient for session IDs).
- */
+function getActiveWorkspaceDir(): string | undefined {
+	const state = (globalThis as Record<symbol, unknown>)[PLUGIN_REGISTRY_STATE] as
+		| { workspaceDir?: string }
+		| null
+		| undefined
+	return state?.workspaceDir
+}
+
 function deriveSessionId(workspaceDir: string): string {
 	const normalised = path.resolve(workspaceDir)
 	const hex = createHash("sha256").update(normalised, "utf8").digest("hex")
 	return `${SESSION_ID_PREFIX}${hex.slice(0, 16)}`
 }
 
-// ── Payload patch helper ──────────────────────────────────────────────────────
+function fallbackSessionId(): string {
+	// Fallback when no workspace is available (e.g. setup runtime).
+	// Uses the OpenClaw state dir — stable per installation but not per agent.
+	const stateDir = process.env.OPENCLAW_STATE_DIR ?? path.join(os.homedir(), ".openclaw")
+	return deriveSessionId(stateDir)
+}
 
-/**
- * Inject session affinity fields into the outbound request body.
- *
- * TaaS checks (in priority order):
- *  1. X-Session-Id HTTP request header   ← can't inject from plugin hooks
- *  2. body.metadata.session_id           ← injected here ✓
- *  3. body.metadata.sticky_key           ← injected here ✓ (Anthropic lane)
- *
- * We only set each field if it isn't already present, so explicit caller
- * overrides always win.
- */
 function patchPayloadMetadata(
 	payload: Record<string, unknown>,
 	sessionId: string
@@ -115,12 +74,10 @@ function patchPayloadMetadata(
 		!Array.isArray(payload.metadata)
 			? (payload.metadata as Record<string, unknown>)
 			: {}
-
+	// Never overwrite an existing session_id/sticky_key — the caller owns it.
 	const needsSessionId = !existingMeta.session_id
 	const needsStickyKey = !existingMeta.sticky_key
-
-	if (!needsSessionId && !needsStickyKey) return payload // nothing to do
-
+	if (!needsSessionId && !needsStickyKey) return payload
 	return {
 		...payload,
 		metadata: {
@@ -131,59 +88,43 @@ function patchPayloadMetadata(
 	}
 }
 
-// ── Plugin export ─────────────────────────────────────────────────────────────
+function buildWrapper(ctx: ProviderWrapStreamFnContext) {
+	const { streamFn } = ctx
+	if (!streamFn) return undefined
+
+	const workspaceDir = ctx.workspaceDir ?? getActiveWorkspaceDir()
+	const sessionId = workspaceDir ? deriveSessionId(workspaceDir) : fallbackSessionId()
+
+	const inner = streamFn
+	return function taasAffinityStreamFn(model, context, options) {
+		const prevOnPayload = options?.onPayload
+		const onPayload = async (
+			payload: Record<string, unknown>,
+			payloadModel: typeof model
+		) => {
+			const patched = patchPayloadMetadata(payload, sessionId)
+			if (prevOnPayload) return prevOnPayload(patched, payloadModel)
+			return patched
+		}
+		return inner(model, context, { ...options, onPayload })
+	} as typeof inner
+}
 
 export default {
 	id: "openclaw-taas-affinity",
-	name: "CloudSigma TaaS Session Affinity",
+	name: "CloudSigma TaaS Token Cache Optimizer",
 	description:
-		"Injects a stable per-conversation session ID into CloudSigma TaaS " +
-		"requests so the affinity layer can pin sessions to the same upstream " +
-		"slot from the very first turn, maximising prompt-cache hit rates.",
+		"Injects a stable per-conversation session ID into outbound LLM requests so TaaS can " +
+		"pin sessions to the same upstream slot from turn 1, maximising prompt-cache hit rates.",
 
 	register(api: OpenClawPluginApi) {
+		// Unique id avoids conflicting with the config-driven "cloudsigma" provider.
+		// hookAliases routes cloudsigma/cloudsigma-staging requests to this hook.
 		api.registerProvider({
-			id: TAAS_PROVIDER_ID,
-			label: "CloudSigma (TaaS affinity)",
-
-			/**
-			 * Wrap the base stream function to inject affinity metadata.
-			 *
-			 * Called once per session run. The returned StreamFn is used for
-			 * every turn in that session.
-			 */
-			wrapStreamFn(ctx: ProviderWrapStreamFnContext) {
-				const { streamFn, workspaceDir, provider } = ctx
-
-				// Guard: only patch requests to the cloudsigma provider.
-				if (provider !== TAAS_PROVIDER_ID) return streamFn ?? undefined
-
-				// Guard: need a workspaceDir to derive the session ID.
-				// Without it we fall through to TaaS heuristic matching.
-				if (!workspaceDir) return streamFn ?? undefined
-
-				const inner = streamFn
-				if (!inner) return undefined
-
-				const sessionId = deriveSessionId(workspaceDir)
-
-				// Wrap: intercept onPayload to inject session fields.
-				return function taasAffinityStreamFn(model, context, options) {
-					const prevOnPayload = options?.onPayload
-
-					const onPayload = async (
-						payload: Record<string, unknown>,
-						payloadModel: typeof model
-					) => {
-						const patched = patchPayloadMetadata(payload, sessionId)
-						// Chain any previously registered onPayload handler.
-						if (prevOnPayload) return prevOnPayload(patched, payloadModel)
-						return patched
-					}
-
-					return inner(model, context, { ...options, onPayload })
-				} as typeof inner
-			},
+			id: "taas-affinity-hook",
+			hookAliases: ["cloudsigma", "cloudsigma-staging"],
+			auth: [],
+			wrapStreamFn: buildWrapper,
 		})
 	},
 }
