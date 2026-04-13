@@ -1,0 +1,10 @@
+{
+	"id": "openclaw-taas-affinity",
+	"kind": "provider",
+	"configSchema": {
+		"type": "object",
+		"additionalProperties": false,
+		"properties": {},
+		"required": []
+	}
+}
