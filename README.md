@@ -38,16 +38,24 @@ OpenClaw's `wrapStreamFn` hook intercepts the outbound request payload before it
 - `session_id` — read by TaaS's OpenAI and Codex affinity paths
 - `sticky_key` — additionally read by the Anthropic substrate routing layer
 
-Both fields point to the same value. No headers are modified.
+Both fields point to the same value. Additionally, the plugin injects an `X-Session-Id` request header via the `resolveTransportTurnState` hook, for transport layers that support per-turn native headers.
 
 ### Session ID derivation
 
-The ID is a SHA-256 hash of the session's `workspaceDir`, truncated to 16 hex chars and prefixed `oc:`:
+The ID is a SHA-256 hash of the session source, truncated to 16 hex chars and prefixed `oc:`. The plugin walks through a tier list to find the best available source:
+
+| Tier | Source | Notes |
+|---|---|---|
+| 1 | `ctx.workspaceDir` (explicit) | Best signal — populated for main agent and many subagents |
+| 2 | `globalThis[pluginRegistryState].workspaceDir` | Parent agent workspace via plugin registry |
+| 3 | `process.env.OPENCLAW_SESSION_ID` | If OpenClaw sets this env var for sub-agents in future |
+| 4 | `process.env.OPENCLAW_AGENT_ID` / `OPENCLAW_RUN_ID` | Any stable per-agent env var |
+| 5 | `OPENCLAW_STATE_DIR` hash | Per-installation fallback — least specific |
 
 | Property | Detail |
 |---|---|
 | **Stable** | Same value for every API turn within one conversation |
-| **Unique** | Each session (main agent, subagent, cron, isolated) has its own workspace → its own ID |
+| **Unique** | Different workspaces / env vars → different IDs |
 | **Resets on `/new`** | New conversation = new workspace = new ID |
 | **Namespaced** | `oc:` prefix avoids collision with Claude Code and other TaaS clients |
 
@@ -56,6 +64,26 @@ Example IDs:
 oc:edebc39a82a8a041   ← main agent session
 oc:4ae2870a2e73027c   ← subagent spawned from the above
 oc:a1b2c3d4e5f60718   ← same agent, next conversation
+```
+
+### Sub-agent behaviour
+
+OpenClaw sub-agents run in isolated processes and may not receive a `workspaceDir` in their `wrapStreamFn` context. Without this plugin, all sub-agent requests arrive at TaaS with `session_id = 'none'`, breaking affinity.
+
+The tier fallback system ensures sub-agents always get a deterministic session ID:
+
+1. **If the sub-agent has a workspace** (Tier 1) — derives a unique ID from it. Sub-agents get their own ID, separate from the parent.
+2. **If the parent agent workspace is visible** via globalThis (Tier 2) — reuses the parent's ID. This is correct behaviour: sub-agents from the same parent conversation share upstream slot affinity.
+3. **If OpenClaw injects env vars** (Tiers 3–4) — uses those for a stable per-agent ID.
+4. **Last resort** (Tier 5) — falls back to the state dir hash. All sub-agents on the same install share this ID, which still beats `session_id = 'none'` for cache-hit purposes.
+
+#### Enabling debug logging
+
+Set `OPENCLAW_DEBUG=1` (or `NODE_ENV=development`) to emit the session ID source on each request:
+
+```
+[taas-affinity] wrapStreamFn sessionId=oc:edebc39a82a8a041 source=workspaceDir:/home/user/.openclaw/...
+[taas-affinity] resolveTransportTurnState sessionId=oc:edebc39a82a8a041 source=workspaceDir:... turnId=abc attempt=1
 ```
 
 ---
