@@ -24,21 +24,37 @@ This plugin passes a stable `session_id` derived from your OpenClaw workspace so
 
 ## How it works
 
-OpenClaw's `wrapStreamFn` hook intercepts the outbound request payload before it is sent to TaaS. The plugin adds two fields:
+OpenClaw's `wrapStreamFn` hook intercepts the outbound request payload before it is sent to TaaS. The plugin adds session affinity fields plus a sanitized requester runtime envelope:
 
 ```json
 {
   "metadata": {
     "session_id": "oc:edebc39a82a8a041",
-    "sticky_key": "oc:edebc39a82a8a041"
+    "sticky_key": "oc:edebc39a82a8a041",
+    "requester_runtime": {
+      "schema_version": "2026-05-18",
+      "source": "openclaw-token-cache-optimizer",
+      "capture_mode": "advisory_only",
+      "session_key": "oc:edebc39a82a8a041",
+      "repo_name": "my-repo",
+      "available_bridges": [],
+      "required_execution_mode": "advisory_only"
+    }
   }
 }
 ```
 
 - `session_id` — read by TaaS's OpenAI and Codex affinity paths
 - `sticky_key` — additionally read by the Anthropic substrate routing layer
+- `requester_runtime` — advisory requester-side runtime hints for downstream Claude Code routing/guardrails
 
-Both fields point to the same value. Additionally, the plugin injects an `X-Session-Id` request header via the `resolveTransportTurnState` hook, for transport layers that support per-turn native headers.
+All metadata fields are no-overwrite: if the caller already supplied them, the plugin leaves them intact. Additionally, the plugin injects an `X-Session-Id` request header via the `resolveTransportTurnState` hook, for transport layers that support per-turn native headers.
+
+### Requester runtime capture
+
+The runtime envelope is intentionally small and sanitized. It can include `workspace_dir` / `agent_dir` when OpenClaw exposes them to the provider hook, bounded repo hints derived from the workspace (`repo_root_hint`, `repo_name`, `git_branch_hint`, `git_dirty_hint`), hashed host/source identifiers, and provider/model hints.
+
+It never includes raw environment variables, tokens, git remotes, full status output, diffs, or arbitrary provider `extraParams`. Git probes are bounded with a short timeout and the bridge capability list defaults to empty with `required_execution_mode = "advisory_only"`.
 
 ### Session ID derivation
 

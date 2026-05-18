@@ -1,4 +1,6 @@
+import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
+import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import type {
@@ -6,7 +8,7 @@ import type {
 	ProviderResolveTransportTurnStateContext,
 	ProviderTransportTurnState,
 	ProviderWrapStreamFnContext,
-} from "openclaw/plugin-sdk"
+} from "openclaw/plugin-sdk/core"
 
 /**
  * openclaw-taas-affinity
@@ -47,6 +49,9 @@ import type {
  */
 
 const SESSION_ID_PREFIX = "oc:"
+const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-05-18"
+const REQUESTER_RUNTIME_SOURCE = "openclaw-token-cache-optimizer"
+const GIT_PROBE_TIMEOUT_MS = 250
 
 // OpenClaw stores the active registry state (including workspaceDir) on globalThis
 // under this well-known symbol key.
@@ -127,26 +132,135 @@ function resolveSessionId(workspaceDirFromCtx?: string): {
 	}
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined
+}
+
+function safeString(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim().length > 0 ? value : undefined
+}
+
+function stableHash(value: string, prefix: string, length = 16): string {
+	const hex = createHash("sha256").update(value, "utf8").digest("hex")
+	return `${prefix}:${hex.slice(0, length)}`
+}
+
+function resolveWorkspaceDir(ctx: ProviderWrapStreamFnContext): string | undefined {
+	return safeString(ctx.workspaceDir)
+}
+
+function resolveAgentDir(ctx: ProviderWrapStreamFnContext): string | undefined {
+	const maybeAgentDir = (ctx as unknown as Record<string, unknown>).agentDir
+	return safeString(maybeAgentDir)
+}
+
+function findRepoRoot(startDir?: string): string | undefined {
+	if (!startDir) return undefined
+	let current = path.resolve(startDir)
+	for (;;) {
+		if (fs.existsSync(path.join(current, ".git"))) return current
+		const parent = path.dirname(current)
+		if (parent === current) return undefined
+		current = parent
+	}
+}
+
+function boundedGit(repoRoot: string, args: string[]): string | undefined {
+	try {
+		const output = execFileSync("git", ["-C", repoRoot, ...args], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+			timeout: GIT_PROBE_TIMEOUT_MS,
+			maxBuffer: 8 * 1024,
+		})
+		return output.trim() || undefined
+	} catch {
+		return undefined
+	}
+}
+
+function readGitHeadBranch(repoRoot?: string): string | undefined {
+	if (!repoRoot) return undefined
+	const gitHead = boundedGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
+	if (gitHead && gitHead !== "HEAD") return gitHead.slice(0, 120)
+
+	try {
+		const headPath = path.join(repoRoot, ".git", "HEAD")
+		const head = fs.readFileSync(headPath, "utf8").trim()
+		const match = /^ref: refs\/heads\/(.+)$/.exec(head)
+		return match?.[1]?.slice(0, 120)
+	} catch {
+		return undefined
+	}
+}
+
+function readGitDirtyHint(repoRoot?: string): boolean | undefined {
+	if (!repoRoot) return undefined
+	const status = boundedGit(repoRoot, ["status", "--porcelain", "--untracked-files=no"])
+	if (status === undefined) return undefined
+	return status.length > 0
+}
+
+/**
+ * Builds a small, sanitized requester runtime envelope for downstream routing.
+ *
+ * This intentionally includes only bounded, locally-derived hints. It never
+ * serializes process.env, git remotes, full git status/diffs, tokens, or
+ * arbitrary provider extraParams.
+ */
+function buildRequesterRuntime(
+	ctx: ProviderWrapStreamFnContext,
+	sessionId: string,
+	source: string
+): Record<string, unknown> {
+	const workspaceDir = resolveWorkspaceDir(ctx)
+	const agentDir = resolveAgentDir(ctx)
+	const repoRoot = findRepoRoot(workspaceDir)
+	const ctxRecord = ctx as unknown as Record<string, unknown>
+	const modelRecord = asRecord(ctxRecord.model)
+	const modelId = safeString(ctxRecord.modelId) ?? safeString(modelRecord?.id)
+
+	return {
+		schema_version: REQUESTER_RUNTIME_SCHEMA_VERSION,
+		source: REQUESTER_RUNTIME_SOURCE,
+		capture_mode: "advisory_only",
+		session_key: sessionId,
+		openclaw_session_id: sessionId,
+		...(workspaceDir && { workspace_dir: path.resolve(workspaceDir) }),
+		...(agentDir && { agent_dir: path.resolve(agentDir) }),
+		...(repoRoot && { repo_root_hint: repoRoot, repo_name: path.basename(repoRoot) }),
+		...(repoRoot && { git_branch_hint: readGitHeadBranch(repoRoot) }),
+		...(repoRoot && { git_dirty_hint: readGitDirtyHint(repoRoot) }),
+		requester_host_id: stableHash(os.hostname(), "host"),
+		...(safeString(ctxRecord.provider) && { provider: safeString(ctxRecord.provider) }),
+		...(modelId && { model_id: modelId }),
+		session_source_hint: stableHash(source, "source"),
+		available_bridges: [],
+		required_execution_mode: "advisory_only",
+		redaction_policy: "no_secrets;bounded_paths;no_env_values;no_git_remotes;no_status_or_diffs;no_extra_params",
+	}
+}
+
 function patchPayloadMetadata(
 	payload: Record<string, unknown>,
-	sessionId: string
+	sessionId: string,
+	requesterRuntime?: Record<string, unknown>
 ): Record<string, unknown> {
-	const existingMeta =
-		payload.metadata !== null &&
-		typeof payload.metadata === "object" &&
-		!Array.isArray(payload.metadata)
-			? (payload.metadata as Record<string, unknown>)
-			: {}
-	// Never overwrite an existing session_id/sticky_key — the caller owns it.
+	const existingMeta = asRecord(payload.metadata) ?? {}
+	// Never overwrite existing metadata fields — the caller owns them.
 	const needsSessionId = !existingMeta.session_id
 	const needsStickyKey = !existingMeta.sticky_key
-	if (!needsSessionId && !needsStickyKey) return payload
+	const needsRequesterRuntime = requesterRuntime && !existingMeta.requester_runtime
+	if (!needsSessionId && !needsStickyKey && !needsRequesterRuntime) return payload
 	return {
 		...payload,
 		metadata: {
 			...existingMeta,
 			...(needsSessionId && { session_id: sessionId }),
 			...(needsStickyKey && { sticky_key: sessionId }),
+			...(needsRequesterRuntime && { requester_runtime: requesterRuntime }),
 		},
 	}
 }
@@ -156,6 +270,7 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 	if (!streamFn) return undefined
 
 	const { sessionId, source } = resolveSessionId(ctx.workspaceDir)
+	const requesterRuntime = buildRequesterRuntime(ctx, sessionId, source)
 
 	if (isDev) {
 		console.debug(`[taas-affinity] wrapStreamFn sessionId=${sessionId} source=${source}`)
@@ -164,11 +279,13 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 	const inner = streamFn
 	return function taasAffinityStreamFn(model, context, options) {
 		const prevOnPayload = options?.onPayload
-		const onPayload = async (
-			payload: Record<string, unknown>,
-			payloadModel: typeof model
-		) => {
-			const patched = patchPayloadMetadata(payload, sessionId)
+		const onPayload = async (payload: unknown, payloadModel: typeof model) => {
+			const payloadRecord = asRecord(payload)
+			if (!payloadRecord) {
+				if (prevOnPayload) return prevOnPayload(payload, payloadModel)
+				return payload
+			}
+			const patched = patchPayloadMetadata(payloadRecord, sessionId, requesterRuntime)
 			if (prevOnPayload) return prevOnPayload(patched, payloadModel)
 			return patched
 		}
@@ -224,6 +341,7 @@ export default {
 		// hookAliases routes cloudsigma/cloudsigma-staging requests to this hook.
 		api.registerProvider({
 			id: "taas-affinity-hook",
+			label: "CloudSigma TaaS Token Cache Optimizer",
 			hookAliases: ["cloudsigma", "cloudsigma-staging"],
 			auth: [],
 			wrapStreamFn: buildWrapper,
