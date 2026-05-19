@@ -277,9 +277,13 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 	}
 
 	const inner = streamFn
-	return function taasAffinityStreamFn(model, context, options) {
+	return function taasAffinityStreamFn(...args: Parameters<typeof inner>) {
+		const [model, context, options] = args
 		const prevOnPayload = options?.onPayload
-		const onPayload = async (payload: unknown, payloadModel: typeof model) => {
+		const onPayload: NonNullable<typeof options>["onPayload"] = async (
+			payload,
+			payloadModel
+		) => {
 			const payloadRecord = asRecord(payload)
 			if (!payloadRecord) {
 				if (prevOnPayload) return prevOnPayload(payload, payloadModel)

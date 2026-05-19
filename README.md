@@ -106,9 +106,13 @@ Set `OPENCLAW_DEBUG=1` (or `NODE_ENV=development`) to emit the session ID source
 
 ## Requirements
 
-- **OpenClaw** ≥ 1.0.0
+- **OpenClaw** ≥ 2026.4.27
+  - Requires the provider plugin hooks exposed via `openclaw/plugin-sdk/core`, including `wrapStreamFn`, `hookAliases`, and `resolveTransportTurnState`.
+- **Node.js** 22+
 - **TaaS** with session-affinity short-circuit support (commit `61a9960`+, April 2026)
 - A CloudSigma account with TaaS access
+
+Older OpenClaw builds may fail to load the plugin or may load it without applying the transport/header hook. Upgrade OpenClaw before deploying this plugin to production instances.
 
 ---
 
@@ -149,6 +153,22 @@ You should see the plugin listed in the startup log:
 ---
 
 ## Verification
+
+### Local validation
+
+For repository/CI validation, install dev dependencies and run the test suite:
+
+```bash
+npm install
+npm test
+```
+
+This runs:
+
+- `npm run typecheck` — validates the TypeScript source against the OpenClaw plugin SDK and Node typings
+- `npm run smoke` — imports the plugin, registers the provider hook, and verifies payload/header injection
+
+If validation fails because `openclaw/plugin-sdk/core` cannot be resolved, the local OpenClaw SDK dependency is missing or too old. Install/upgrade OpenClaw before deploying.
 
 ### TaaS logs
 
