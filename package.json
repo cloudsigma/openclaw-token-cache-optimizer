@@ -24,7 +24,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "smoke": "node test/smoke.mjs",
-    "test": "npm run typecheck && npm run smoke"
+    "unit": "node --import tsx --test test/*.test.ts",
+    "test": "npm run typecheck && npm run smoke && npm run unit"
   },
   "keywords": [
     "openclaw",
@@ -42,6 +43,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "openclaw": "^2026.5.18",
+    "tsx": "^4.20.0",
     "typescript": "^5.0.0"
   }
 }

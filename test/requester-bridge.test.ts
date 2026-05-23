@@ -1,0 +1,122 @@
+import assert from "node:assert/strict"
+import { createServer } from "node:http"
+import { test } from "node:test"
+
+async function loadPlugin(env: Record<string, string | undefined> = {}) {
+	const oldEnv: Record<string, string | undefined> = {}
+	for (const [key, value] of Object.entries(env)) {
+		oldEnv[key] = process.env[key]
+		if (value === undefined) delete process.env[key]
+		else process.env[key] = value
+	}
+	const mod = await import(`../index.ts?cacheBust=${Date.now()}-${Math.random()}`)
+	return {
+		plugin: mod.default,
+		restore() {
+			for (const [key, value] of Object.entries(oldEnv)) {
+				if (value === undefined) delete process.env[key]
+				else process.env[key] = value
+			}
+		},
+	}
+}
+
+function captureWrapper(plugin: any) {
+	let hook: any
+	plugin.register({ registerProvider(provider: any) { hook = provider } })
+	return hook.wrapStreamFn
+}
+
+async function runPayload(wrapperFactory: any, payload: any, ctxExtra: Record<string, unknown> = {}) {
+	let captured: any
+	const streamFn = (_model: any, _context: any, options: any) => options.onPayload(payload, _model).then((result: any) => {
+		captured = result
+		return result
+	})
+	const wrapper = wrapperFactory({
+		provider: "cloudsigma",
+		modelId: "claude-code",
+		workspaceDir: process.cwd(),
+		model: { id: "claude-code", baseUrl: ctxExtra.baseUrl },
+		streamFn,
+		...ctxExtra,
+	})
+	await wrapper({}, {}, {})
+	return captured
+}
+
+test("plugin disabled preserves advisory-only requester runtime", async () => {
+	const { plugin, restore } = await loadPlugin({ TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED: undefined })
+	try {
+		const payload = await runPayload(captureWrapper(plugin), { messages: [] })
+		assert.equal(payload.metadata.requester_runtime.capture_mode, "advisory_only")
+		assert.deepEqual(payload.metadata.requester_runtime.available_bridges, [])
+		assert.equal("bridge_required" in payload.metadata.requester_runtime, false)
+	} finally {
+		restore()
+	}
+})
+
+test("plugin enabled creates lease and injects bridge-capable descriptor", async () => {
+	let requestBody: any
+	const server = createServer((req, res) => {
+		assert.equal(req.method, "POST")
+		assert.equal(req.url, "/internal/requester-bridges/leases")
+		let body = ""
+		req.on("data", (chunk) => { body += chunk })
+		req.on("end", () => {
+			requestBody = JSON.parse(body)
+			res.setHeader("Content-Type", "application/json")
+			res.end(JSON.stringify({
+				ok: true,
+				descriptor: {
+					name: "requester-workspace",
+					version: "2026-05-23",
+					status: "verified",
+					bridge_id: "br_test",
+					lease_id: "brl_test",
+					capabilities: ["openclaw.tool.invoke"],
+					endpoint_ref: "epref_test",
+					auth_context_id: "authctx_test",
+					expires_at: "2026-05-23T19:00:00Z",
+				},
+			}))
+		})
+	})
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+	const address = server.address()
+	assert(address && typeof address === "object")
+	const baseUrl = `http://127.0.0.1:${address.port}`
+	const { plugin, restore } = await loadPlugin({ TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED: "1" })
+	try {
+		const payload = await runPayload(captureWrapper(plugin), { messages: [] }, { baseUrl })
+		assert.equal(requestBody.schema_version, "2026-05-23")
+		assert.deepEqual(requestBody.capabilities, ["openclaw.tool.invoke"])
+		assert.equal(payload.metadata.requester_runtime.capture_mode, "bridge_capable")
+		assert.equal(payload.metadata.requester_runtime.available_bridges[0].lease_id, "brl_test")
+		assert.equal("bridge_required" in payload.metadata.requester_runtime, false)
+		assert.equal(JSON.stringify(payload).includes("access_token"), false)
+	} finally {
+		restore()
+		server.close()
+	}
+})
+
+test("lease failure falls back to advisory-only empty bridges", async () => {
+	const server = createServer((_req, res) => {
+		res.statusCode = 503
+		res.end(JSON.stringify({ ok: false }))
+	})
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+	const address = server.address()
+	assert(address && typeof address === "object")
+	const { plugin, restore } = await loadPlugin({ TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED: "true" })
+	try {
+		const payload = await runPayload(captureWrapper(plugin), { messages: [] }, { baseUrl: `http://127.0.0.1:${address.port}` })
+		assert.equal(payload.metadata.requester_runtime.capture_mode, "advisory_only")
+		assert.deepEqual(payload.metadata.requester_runtime.available_bridges, [])
+	} finally {
+		restore()
+		server.close()
+	}
+})

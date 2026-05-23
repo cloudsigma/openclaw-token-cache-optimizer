@@ -17,41 +17,39 @@ import type {
  * outbound request to CloudSigma TaaS providers so the session-affinity layer
  * achieves confidence=1.0 from turn 1, maximising prompt-cache hit rates.
  *
- * ## How it works
- *
- * 1. Derives a stable session ID from the active agent's workspace directory path
- *    (or env-var fallbacks for sub-agent contexts — see Tier list below).
- *    Different agents (different workspaces) get different IDs.
- *
- * 2. Injects two fields into every outbound request body (never overwrites an
- *    existing value so callers can still override):
- *      body.metadata.session_id  — read by TaaS OpenAI-compat affinity path
- *      body.metadata.sticky_key  — read by TaaS Anthropic affinity path
- *
- * 3. Also injects an X-Session-Id request header via resolveTransportTurnState
- *    for transport layers that honour native per-turn headers.
- *
- * ## Session ID derivation tiers
- *
- * Tier 1 (best): ctx.workspaceDir passed explicitly by OpenClaw
- * Tier 2:        globalThis[PLUGIN_REGISTRY_STATE].workspaceDir — parent agent workspace
- * Tier 3:        process.env.OPENCLAW_SESSION_ID — if OpenClaw sets this for sub-agents
- * Tier 4:        process.env.OPENCLAW_AGENT_ID ?? process.env.OPENCLAW_RUN_ID
- * Tier 5 (last): OPENCLAW_STATE_DIR hash — per-installation, least specific
- *
- * ## Manifest wiring
- *
- * The plugin registers with id "taas-affinity-hook" (unique, avoids conflicting
- * with the config-driven "cloudsigma" provider) and uses hookAliases to tell
- * matchesProviderId that this plugin handles cloudsigma and cloudsigma-staging
- * requests. The manifest providers array tells resolveOwningPluginIdsForProvider
- * to load this plugin when those providers are active.
+ * When explicitly enabled with TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED, the plugin
+ * also creates/refreshes a short TaaS requester bridge lease and injects the
+ * returned opaque descriptor into metadata.requester_runtime.available_bridges.
+ * The bridge remains OpenClaw-authorized: TaaS is the relay/audit/transport
+ * layer, while OpenClaw/plugin-side permissions decide actual tool execution.
  */
 
 const SESSION_ID_PREFIX = "oc:"
-const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-05-18"
+const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-05-23"
 const REQUESTER_RUNTIME_SOURCE = "openclaw-token-cache-optimizer"
+const REQUESTER_BRIDGE_PLUGIN_FLAG = "TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED"
+const REQUESTER_BRIDGE_LEASE_PATH = "/internal/requester-bridges/leases"
+const REQUESTER_BRIDGE_CAPABILITY = "openclaw.tool.invoke"
+const REQUESTER_BRIDGE_DEFAULT_TTL_SECONDS = 5 * 60
 const GIT_PROBE_TIMEOUT_MS = 250
+const LEASE_REQUEST_TIMEOUT_MS = 1200
+
+type RequesterRuntime = Record<string, unknown>
+
+type RuntimeContextHints = {
+	workspaceDir?: string
+	agentDir?: string
+	repoRoot?: string
+	modelId?: string
+	provider?: string
+}
+
+type LeaseResponse = {
+	ok?: boolean
+	descriptor?: unknown
+	lease_id?: unknown
+	bridge_id?: unknown
+}
 
 // OpenClaw stores the active registry state (including workspaceDir) on globalThis
 // under this well-known symbol key.
@@ -59,6 +57,16 @@ const PLUGIN_REGISTRY_STATE = Symbol.for("openclaw.pluginRegistryState")
 
 const isDev =
 	process.env.NODE_ENV === "development" || Boolean(process.env.OPENCLAW_DEBUG)
+
+function envFlag(name: string): boolean {
+	return ["1", "true", "yes", "on"].includes(
+		(process.env[name] ?? "").trim().toLowerCase()
+	)
+}
+
+function requesterBridgePluginEnabled(): boolean {
+	return envFlag(REQUESTER_BRIDGE_PLUGIN_FLAG)
+}
 
 /**
  * Resolves the best available session source string, working through the
@@ -203,6 +211,22 @@ function readGitDirtyHint(repoRoot?: string): boolean | undefined {
 	return status.length > 0
 }
 
+function runtimeContextHints(ctx: ProviderWrapStreamFnContext): RuntimeContextHints {
+	const workspaceDir = resolveWorkspaceDir(ctx)
+	const agentDir = resolveAgentDir(ctx)
+	const repoRoot = findRepoRoot(workspaceDir)
+	const ctxRecord = ctx as unknown as Record<string, unknown>
+	const modelRecord = asRecord(ctxRecord.model)
+	const modelId = safeString(ctxRecord.modelId) ?? safeString(modelRecord?.id)
+	return {
+		workspaceDir,
+		agentDir,
+		repoRoot,
+		modelId,
+		provider: safeString(ctxRecord.provider),
+	}
+}
+
 /**
  * Builds a small, sanitized requester runtime envelope for downstream routing.
  *
@@ -214,28 +238,22 @@ function buildRequesterRuntime(
 	ctx: ProviderWrapStreamFnContext,
 	sessionId: string,
 	source: string
-): Record<string, unknown> {
-	const workspaceDir = resolveWorkspaceDir(ctx)
-	const agentDir = resolveAgentDir(ctx)
-	const repoRoot = findRepoRoot(workspaceDir)
-	const ctxRecord = ctx as unknown as Record<string, unknown>
-	const modelRecord = asRecord(ctxRecord.model)
-	const modelId = safeString(ctxRecord.modelId) ?? safeString(modelRecord?.id)
-
+): RequesterRuntime {
+	const hints = runtimeContextHints(ctx)
 	return {
 		schema_version: REQUESTER_RUNTIME_SCHEMA_VERSION,
 		source: REQUESTER_RUNTIME_SOURCE,
 		capture_mode: "advisory_only",
 		session_key: sessionId,
 		openclaw_session_id: sessionId,
-		...(workspaceDir && { workspace_dir: path.resolve(workspaceDir) }),
-		...(agentDir && { agent_dir: path.resolve(agentDir) }),
-		...(repoRoot && { repo_root_hint: repoRoot, repo_name: path.basename(repoRoot) }),
-		...(repoRoot && { git_branch_hint: readGitHeadBranch(repoRoot) }),
-		...(repoRoot && { git_dirty_hint: readGitDirtyHint(repoRoot) }),
+		...(hints.workspaceDir && { workspace_dir: path.resolve(hints.workspaceDir) }),
+		...(hints.agentDir && { agent_dir: path.resolve(hints.agentDir) }),
+		...(hints.repoRoot && { repo_root_hint: hints.repoRoot, repo_name: path.basename(hints.repoRoot) }),
+		...(hints.repoRoot && { git_branch_hint: readGitHeadBranch(hints.repoRoot) }),
+		...(hints.repoRoot && { git_dirty_hint: readGitDirtyHint(hints.repoRoot) }),
 		requester_host_id: stableHash(os.hostname(), "host"),
-		...(safeString(ctxRecord.provider) && { provider: safeString(ctxRecord.provider) }),
-		...(modelId && { model_id: modelId }),
+		...(hints.provider && { provider: hints.provider }),
+		...(hints.modelId && { model_id: hints.modelId }),
 		session_source_hint: stableHash(source, "source"),
 		available_bridges: [],
 		required_execution_mode: "advisory_only",
@@ -243,24 +261,150 @@ function buildRequesterRuntime(
 	}
 }
 
-function patchPayloadMetadata(
+function isTaasProvider(ctx: ProviderWrapStreamFnContext): boolean {
+	const provider = safeString((ctx as unknown as Record<string, unknown>).provider)
+	return provider === "cloudsigma" || provider === "cloudsigma-staging"
+}
+
+function providerBaseUrl(payload: Record<string, unknown>, ctx: ProviderWrapStreamFnContext): string | undefined {
+	const direct = safeString(payload.base_url) ?? safeString(payload.baseURL)
+	if (direct) return direct
+	const modelRecord = asRecord((ctx as unknown as Record<string, unknown>).model)
+	return safeString(modelRecord?.baseUrl) ?? safeString(modelRecord?.baseURL)
+}
+
+function requesterBridgeLeaseUrl(payload: Record<string, unknown>, ctx: ProviderWrapStreamFnContext): string | undefined {
+	const explicit = safeString(process.env.TAAS_REQUESTER_BRIDGE_LEASE_URL)
+	if (explicit) return explicit
+	const base = providerBaseUrl(payload, ctx)
+	if (!base) return undefined
+	try {
+		return new URL(REQUESTER_BRIDGE_LEASE_PATH, base.endsWith("/") ? base : `${base}/`).toString()
+	} catch {
+		return undefined
+	}
+}
+
+function isSafeDescriptor(value: unknown): value is Record<string, unknown> {
+	const descriptor = asRecord(value)
+	if (!descriptor) return false
+	if ("bridge_required" in descriptor) return false
+	const capabilities = descriptor.capabilities
+	if (!Array.isArray(capabilities) || capabilities.includes(REQUESTER_BRIDGE_CAPABILITY) === false) {
+		return false
+	}
+	const encoded = JSON.stringify(descriptor)
+	const lowered = encoded.toLowerCase()
+	return ![
+		"endpoint_url",
+		"access_token",
+		"refresh_token",
+		"authorization",
+		"bearer ",
+		"api_key",
+		"apikey",
+		"password",
+		"secret",
+	].some((needle) => lowered.includes(needle))
+}
+
+async function createRequesterBridgeLease(
+	url: string,
+	runtime: RequesterRuntime,
+	ctx: ProviderWrapStreamFnContext
+): Promise<Record<string, unknown> | undefined> {
+	const workspaceDir = safeString(runtime.workspace_dir)
+	const repoRoot = safeString(runtime.repo_root_hint)
+	const repoName = safeString(runtime.repo_name)
+	const controller = new AbortController()
+	const timer = setTimeout(() => controller.abort(), LEASE_REQUEST_TIMEOUT_MS)
+	try {
+		const body = {
+			schema_version: REQUESTER_RUNTIME_SCHEMA_VERSION,
+			session_key: runtime.session_key,
+			openclaw_session_id: runtime.openclaw_session_id,
+			requester_host_id: runtime.requester_host_id,
+			workspace: {
+				...(workspaceDir && { workspace_dir: workspaceDir }),
+				...(repoRoot && { repo_root: repoRoot }),
+				...(repoName && { repo_name: repoName }),
+			},
+			capabilities: [REQUESTER_BRIDGE_CAPABILITY],
+			ttl_s: REQUESTER_BRIDGE_DEFAULT_TTL_SECONDS,
+			callback: { mode: "poll" },
+			client: {
+				source: REQUESTER_RUNTIME_SOURCE,
+				provider: runtime.provider,
+				model_id: runtime.model_id,
+			},
+		}
+		const response = await fetch(url, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"X-Session-Id": String(runtime.session_key),
+			},
+			body: JSON.stringify(body),
+			signal: controller.signal,
+		})
+		if (!response.ok) {
+			if (isDev) console.debug(`[taas-affinity] requester bridge lease failed status=${response.status}`)
+			return undefined
+		}
+		const json = (await response.json()) as LeaseResponse
+		if (!json.ok || !isSafeDescriptor(json.descriptor)) return undefined
+		return json.descriptor
+	} catch (err) {
+		if (isDev) console.debug(`[taas-affinity] requester bridge lease unavailable: ${err instanceof Error ? err.name : "unknown"}`)
+		return undefined
+	} finally {
+		clearTimeout(timer)
+	}
+}
+
+async function maybeUpgradeRequesterRuntimeWithBridge(
+	runtime: RequesterRuntime,
+	payload: Record<string, unknown>,
+	ctx: ProviderWrapStreamFnContext
+): Promise<RequesterRuntime> {
+	if (!requesterBridgePluginEnabled() || !isTaasProvider(ctx)) return runtime
+	const url = requesterBridgeLeaseUrl(payload, ctx)
+	if (!url) {
+		if (isDev) console.debug("[taas-affinity] requester bridge enabled but no TaaS base URL found")
+		return runtime
+	}
+	const descriptor = await createRequesterBridgeLease(url, runtime, ctx)
+	if (!descriptor) return runtime
+	return {
+		...runtime,
+		capture_mode: "bridge_capable",
+		available_bridges: [descriptor],
+		required_execution_mode: "advisory_only",
+	}
+}
+
+async function patchPayloadMetadata(
 	payload: Record<string, unknown>,
 	sessionId: string,
-	requesterRuntime?: Record<string, unknown>
-): Record<string, unknown> {
+	requesterRuntime?: RequesterRuntime,
+	ctx?: ProviderWrapStreamFnContext
+): Promise<Record<string, unknown>> {
 	const existingMeta = asRecord(payload.metadata) ?? {}
 	// Never overwrite existing metadata fields — the caller owns them.
 	const needsSessionId = !existingMeta.session_id
 	const needsStickyKey = !existingMeta.sticky_key
 	const needsRequesterRuntime = requesterRuntime && !existingMeta.requester_runtime
 	if (!needsSessionId && !needsStickyKey && !needsRequesterRuntime) return payload
+	const runtime = needsRequesterRuntime && requesterRuntime && ctx
+		? await maybeUpgradeRequesterRuntimeWithBridge(requesterRuntime, payload, ctx)
+		: requesterRuntime
 	return {
 		...payload,
 		metadata: {
 			...existingMeta,
 			...(needsSessionId && { session_id: sessionId }),
 			...(needsStickyKey && { sticky_key: sessionId }),
-			...(needsRequesterRuntime && { requester_runtime: requesterRuntime }),
+			...(needsRequesterRuntime && { requester_runtime: runtime }),
 		},
 	}
 }
@@ -289,7 +433,7 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 				if (prevOnPayload) return prevOnPayload(payload, payloadModel)
 				return payload
 			}
-			const patched = patchPayloadMetadata(payloadRecord, sessionId, requesterRuntime)
+			const patched = await patchPayloadMetadata(payloadRecord, sessionId, requesterRuntime, ctx)
 			if (prevOnPayload) return prevOnPayload(patched, payloadModel)
 			return patched
 		}
