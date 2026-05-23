@@ -1,11 +1,12 @@
 {
   "name": "openclaw-taas-affinity",
   "version": "0.2.0",
-  "description": "OpenClaw provider plugin — CloudSigma TaaS session affinity. Injects a stable X-Session-Id header per conversation so TaaS can pin the session to the same OAuth token / Bedrock region / Claude Code node, maximising prompt-cache hit rates.",
+  "description": "OpenClaw provider plugin \u2014 CloudSigma TaaS session affinity. Injects a stable X-Session-Id header per conversation so TaaS can pin the session to the same OAuth token / Bedrock region / Claude Code node, maximising prompt-cache hit rates.",
   "type": "module",
   "main": "index.ts",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "keywords": [
     "openclaw",
@@ -21,6 +22,7 @@
     "openclaw": ">=1.0.0"
   },
   "devDependencies": {
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "tsx": "^4.20.0"
   }
 }
