@@ -120,3 +120,74 @@ test("lease failure falls back to advisory-only empty bridges", async () => {
 		server.close()
 	}
 })
+
+
+test("plugin enabled polls and executes safe bridge scaffold operation", async () => {
+	let pollCount = 0
+	let resultBody: any
+	const server = createServer((req, res) => {
+		let body = ""
+		req.on("data", (chunk) => { body += chunk })
+		req.on("end", () => {
+			res.setHeader("Content-Type", "application/json")
+			if (req.url === "/internal/requester-bridges/leases") {
+				res.end(JSON.stringify({
+					ok: true,
+					descriptor: {
+						name: "requester-workspace",
+						version: "2026-05-23",
+						status: "verified",
+						bridge_id: "br_test",
+						lease_id: "brl_poll",
+						capabilities: ["openclaw.tool.invoke"],
+						endpoint_ref: "epref_test",
+						auth_context_id: "authctx_test",
+						expires_at: "2026-05-23T19:00:00Z",
+					},
+				}))
+				return
+			}
+			if (req.url === "/internal/requester-bridges/poll") {
+				pollCount += 1
+				res.end(JSON.stringify({
+					ok: true,
+					operations: pollCount === 1 ? [{
+						operation_id: "bro_test",
+						audit_id: "bra_test",
+						lease_id: "brl_poll",
+						bridge_id: "br_test",
+						operation: "openclaw.tool.invoke",
+						arguments: { tool: "bridge.ping", arguments: { message: "hi" } },
+					}] : [],
+				}))
+				return
+			}
+			if (req.url === "/internal/requester-bridges/results") {
+				resultBody = JSON.parse(body)
+				res.end(JSON.stringify({ ok: true }))
+				return
+			}
+			res.statusCode = 404
+			res.end(JSON.stringify({ ok: false }))
+		})
+	})
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+	const address = server.address()
+	assert(address && typeof address === "object")
+	const { plugin, restore } = await loadPlugin({
+		TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED: "1",
+		TAAS_REQUESTER_BRIDGE_POLL_INTERVAL_MS: "50",
+	})
+	try {
+		await runPayload(captureWrapper(plugin), { messages: [] }, { baseUrl: `http://127.0.0.1:${address.port}` })
+		await new Promise((resolve) => setTimeout(resolve, 150))
+		assert.equal(resultBody.operation_id, "bro_test")
+		assert.equal(resultBody.ok, true)
+		assert.equal(resultBody.result.pong, true)
+		assert.equal(resultBody.result.scaffold, true)
+		assert.equal(JSON.stringify(resultBody).includes("bridge_required"), false)
+	} finally {
+		restore()
+		server.close()
+	}
+})

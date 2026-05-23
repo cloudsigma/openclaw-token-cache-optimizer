@@ -29,10 +29,15 @@ const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-05-23"
 const REQUESTER_RUNTIME_SOURCE = "openclaw-token-cache-optimizer"
 const REQUESTER_BRIDGE_PLUGIN_FLAG = "TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED"
 const REQUESTER_BRIDGE_LEASE_PATH = "/internal/requester-bridges/leases"
+const REQUESTER_BRIDGE_POLL_PATH = "/internal/requester-bridges/poll"
+const REQUESTER_BRIDGE_RESULTS_PATH = "/internal/requester-bridges/results"
 const REQUESTER_BRIDGE_CAPABILITY = "openclaw.tool.invoke"
 const REQUESTER_BRIDGE_DEFAULT_TTL_SECONDS = 5 * 60
 const GIT_PROBE_TIMEOUT_MS = 250
 const LEASE_REQUEST_TIMEOUT_MS = 1200
+const POLL_REQUEST_TIMEOUT_MS = 1200
+const DEFAULT_POLL_INTERVAL_MS = 1000
+const MAX_ECHO_BYTES = 4096
 
 type RequesterRuntime = Record<string, unknown>
 
@@ -51,12 +56,25 @@ type LeaseResponse = {
 	bridge_id?: unknown
 }
 
+type BridgePollOperation = {
+	operation_id?: unknown
+	audit_id?: unknown
+	lease_id?: unknown
+	bridge_id?: unknown
+	operation?: unknown
+	arguments?: unknown
+}
+
+type PollerState = { timer?: NodeJS.Timeout; inFlight: boolean }
+
 // OpenClaw stores the active registry state (including workspaceDir) on globalThis
 // under this well-known symbol key.
 const PLUGIN_REGISTRY_STATE = Symbol.for("openclaw.pluginRegistryState")
 
 const isDev =
 	process.env.NODE_ENV === "development" || Boolean(process.env.OPENCLAW_DEBUG)
+
+const activePollers = new Map<string, PollerState>()
 
 function envFlag(name: string): boolean {
 	return ["1", "true", "yes", "on"].includes(
@@ -285,6 +303,119 @@ function requesterBridgeLeaseUrl(payload: Record<string, unknown>, ctx: Provider
 	}
 }
 
+function bridgeSiblingUrl(leaseUrl: string, pathName: string): string | undefined {
+	try {
+		const url = new URL(leaseUrl)
+		url.pathname = pathName
+		url.search = ""
+		return url.toString()
+	} catch {
+		return undefined
+	}
+}
+
+function pollIntervalMs(): number {
+	const value = Number.parseInt(process.env.TAAS_REQUESTER_BRIDGE_POLL_INTERVAL_MS ?? "", 10)
+	if (Number.isFinite(value) && value >= 50) return Math.min(value, 30_000)
+	return DEFAULT_POLL_INTERVAL_MS
+}
+
+function boundedJson(value: unknown): unknown {
+	const encoded = JSON.stringify(value ?? null)
+	if (encoded.length <= MAX_ECHO_BYTES) return value
+	return { truncated: true, message: "echo payload exceeded bridge scaffold size limit" }
+}
+
+async function executeSafeBridgeOperation(operation: BridgePollOperation): Promise<{ ok: true; result: unknown } | { ok: false; error: { code: string; message: string } }> {
+	if (operation.operation !== REQUESTER_BRIDGE_CAPABILITY) {
+		return { ok: false, error: { code: "unsupported_operation", message: "Unsupported requester bridge operation" } }
+	}
+	const args = asRecord(operation.arguments) ?? {}
+	const tool = safeString(args.tool) ?? safeString(args.name)
+	const toolArgs = asRecord(args.arguments) ?? asRecord(args.input) ?? {}
+	if (tool === "bridge.ping") {
+		return { ok: true, result: { pong: true, echo: boundedJson(toolArgs), scaffold: true } }
+	}
+	if (tool === "bridge.echo") {
+		return { ok: true, result: { echo: boundedJson(toolArgs), scaffold: true } }
+	}
+	return { ok: false, error: { code: "tool_not_available", message: "Requester bridge scaffold only supports bridge.ping and bridge.echo" } }
+}
+
+async function postBridgeResult(resultsUrl: string, descriptor: Record<string, unknown>, operation: BridgePollOperation, outcome: Awaited<ReturnType<typeof executeSafeBridgeOperation>>): Promise<void> {
+	const controller = new AbortController()
+	const timer = setTimeout(() => controller.abort(), POLL_REQUEST_TIMEOUT_MS)
+	try {
+		await fetch(resultsUrl, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				schema_version: REQUESTER_RUNTIME_SCHEMA_VERSION,
+				lease_id: descriptor.lease_id,
+				bridge_id: descriptor.bridge_id,
+				auth_context_id: descriptor.auth_context_id,
+				operation_id: operation.operation_id,
+				audit_id: operation.audit_id,
+				...outcome,
+			}),
+			signal: controller.signal,
+		})
+	} catch (err) {
+		if (isDev) console.debug(`[taas-affinity] requester bridge result post failed: ${err instanceof Error ? err.name : "unknown"}`)
+	} finally {
+		clearTimeout(timer)
+	}
+}
+
+async function pollRequesterBridgeOnce(pollUrl: string, resultsUrl: string, descriptor: Record<string, unknown>, state: PollerState): Promise<void> {
+	if (state.inFlight) return
+	state.inFlight = true
+	const controller = new AbortController()
+	const timer = setTimeout(() => controller.abort(), POLL_REQUEST_TIMEOUT_MS)
+	try {
+		const response = await fetch(pollUrl, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				schema_version: REQUESTER_RUNTIME_SCHEMA_VERSION,
+				lease_id: descriptor.lease_id,
+				bridge_id: descriptor.bridge_id,
+				auth_context_id: descriptor.auth_context_id,
+				max_operations: 10,
+			}),
+			signal: controller.signal,
+		})
+		if (!response.ok) return
+		const json = await response.json() as { operations?: unknown }
+		const operations = Array.isArray(json.operations) ? json.operations : []
+		for (const raw of operations) {
+			const operation = asRecord(raw) as BridgePollOperation | undefined
+			if (!operation || !operation.operation_id) continue
+			const outcome = await executeSafeBridgeOperation(operation)
+			await postBridgeResult(resultsUrl, descriptor, operation, outcome)
+		}
+	} catch (err) {
+		if (isDev) console.debug(`[taas-affinity] requester bridge poll failed: ${err instanceof Error ? err.name : "unknown"}`)
+	} finally {
+		clearTimeout(timer)
+		state.inFlight = false
+	}
+}
+
+function startRequesterBridgePoller(leaseUrl: string, descriptor: Record<string, unknown>): void {
+	const leaseId = safeString(descriptor.lease_id)
+	if (!leaseId || activePollers.has(leaseId)) return
+	const pollUrl = bridgeSiblingUrl(leaseUrl, REQUESTER_BRIDGE_POLL_PATH)
+	const resultsUrl = bridgeSiblingUrl(leaseUrl, REQUESTER_BRIDGE_RESULTS_PATH)
+	if (!pollUrl || !resultsUrl) return
+	const state: PollerState = { inFlight: false }
+	activePollers.set(leaseId, state)
+	const tick = () => { void pollRequesterBridgeOnce(pollUrl, resultsUrl, descriptor, state) }
+	state.timer = setInterval(tick, pollIntervalMs())
+	state.timer.unref?.()
+	tick()
+}
+
 function isSafeDescriptor(value: unknown): value is Record<string, unknown> {
 	const descriptor = asRecord(value)
 	if (!descriptor) return false
@@ -353,7 +484,9 @@ async function createRequesterBridgeLease(
 		}
 		const json = (await response.json()) as LeaseResponse
 		if (!json.ok || !isSafeDescriptor(json.descriptor)) return undefined
-		return json.descriptor
+		const descriptor = json.descriptor
+		startRequesterBridgePoller(url, descriptor)
+		return descriptor
 	} catch (err) {
 		if (isDev) console.debug(`[taas-affinity] requester bridge lease unavailable: ${err instanceof Error ? err.name : "unknown"}`)
 		return undefined
