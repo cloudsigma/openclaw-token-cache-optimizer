@@ -17,17 +17,19 @@ import type {
  * outbound request to CloudSigma TaaS providers so the session-affinity layer
  * achieves confidence=1.0 from turn 1, maximising prompt-cache hit rates.
  *
- * When explicitly enabled with TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED, the plugin
- * also creates/refreshes a short TaaS requester bridge lease and injects the
- * returned opaque descriptor into metadata.requester_runtime.available_bridges.
- * The bridge remains OpenClaw-authorized: TaaS is the relay/audit/transport
- * layer, while OpenClaw/plugin-side permissions decide actual tool execution.
+ * For CloudSigma TaaS providers, the plugin also creates/refreshes a short
+ * requester bridge lease and injects the returned opaque descriptor into
+ * metadata.requester_runtime.available_bridges. Set
+ * TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED=0 to disable this behaviour explicitly.
+ * The bridge remains requester-authorized: TaaS is the relay/audit/transport
+ * layer, while requester/plugin-side permissions decide actual tool execution.
  */
 
 const SESSION_ID_PREFIX = "oc:"
 const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-05-23"
 const REQUESTER_RUNTIME_SOURCE = "openclaw-token-cache-optimizer"
 const REQUESTER_BRIDGE_PLUGIN_FLAG = "TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED"
+const DEFAULT_TAAS_BASE_URL = "https://taas.cloudsigma.com"
 const REQUESTER_BRIDGE_LEASE_PATH = "/internal/requester-bridges/leases"
 const REQUESTER_BRIDGE_POLL_PATH = "/internal/requester-bridges/poll"
 const REQUESTER_BRIDGE_RESULTS_PATH = "/internal/requester-bridges/results"
@@ -77,14 +79,14 @@ const isDev =
 
 const activePollers = new Map<string, PollerState>()
 
-function envFlag(name: string): boolean {
-	return ["1", "true", "yes", "on"].includes(
+function envFlagDisabled(name: string): boolean {
+	return ["0", "false", "no", "off"].includes(
 		(process.env[name] ?? "").trim().toLowerCase()
 	)
 }
 
 function requesterBridgePluginEnabled(): boolean {
-	return envFlag(REQUESTER_BRIDGE_PLUGIN_FLAG)
+	return !envFlagDisabled(REQUESTER_BRIDGE_PLUGIN_FLAG)
 }
 
 /**
@@ -295,8 +297,7 @@ function providerBaseUrl(payload: Record<string, unknown>, ctx: ProviderWrapStre
 function requesterBridgeLeaseUrl(payload: Record<string, unknown>, ctx: ProviderWrapStreamFnContext): string | undefined {
 	const explicit = safeString(process.env.TAAS_REQUESTER_BRIDGE_LEASE_URL)
 	if (explicit) return explicit
-	const base = providerBaseUrl(payload, ctx)
-	if (!base) return undefined
+	const base = providerBaseUrl(payload, ctx) ?? DEFAULT_TAAS_BASE_URL
 	try {
 		return new URL(REQUESTER_BRIDGE_LEASE_PATH, base.endsWith("/") ? base : `${base}/`).toString()
 	} catch {

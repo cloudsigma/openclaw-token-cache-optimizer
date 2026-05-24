@@ -45,8 +45,8 @@ async function runPayload(wrapperFactory: any, payload: any, ctxExtra: Record<st
 	return captured
 }
 
-test("plugin disabled preserves advisory-only requester runtime", async () => {
-	const { plugin, restore } = await loadPlugin({ TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED: undefined })
+test("bridge can be explicitly disabled and preserves advisory-only requester runtime", async () => {
+	const { plugin, restore } = await loadPlugin({ TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED: "0" })
 	try {
 		const payload = await runPayload(captureWrapper(plugin), { messages: [] })
 		assert.equal(payload.metadata.requester_runtime.capture_mode, "advisory_only")
@@ -87,7 +87,7 @@ test("plugin enabled creates lease and injects bridge-capable descriptor", async
 	const address = server.address()
 	assert(address && typeof address === "object")
 	const baseUrl = `http://127.0.0.1:${address.port}`
-	const { plugin, restore } = await loadPlugin({ TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED: "1" })
+	const { plugin, restore } = await loadPlugin({})
 	try {
 		const payload = await runPayload(captureWrapper(plugin), { messages: [] }, { baseUrl })
 		assert.equal(requestBody.schema_version, "2026-05-23")
@@ -110,7 +110,7 @@ test("lease failure falls back to advisory-only empty bridges", async () => {
 	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
 	const address = server.address()
 	assert(address && typeof address === "object")
-	const { plugin, restore } = await loadPlugin({ TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED: "true" })
+	const { plugin, restore } = await loadPlugin({})
 	try {
 		const payload = await runPayload(captureWrapper(plugin), { messages: [] }, { baseUrl: `http://127.0.0.1:${address.port}` })
 		assert.equal(payload.metadata.requester_runtime.capture_mode, "advisory_only")
@@ -175,7 +175,6 @@ test("plugin enabled polls and executes safe bridge scaffold operation", async (
 	const address = server.address()
 	assert(address && typeof address === "object")
 	const { plugin, restore } = await loadPlugin({
-		TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED: "1",
 		TAAS_REQUESTER_BRIDGE_POLL_INTERVAL_MS: "50",
 	})
 	try {
@@ -245,7 +244,6 @@ test("plugin handles legacy openclaw.tool.invoke operation name in poll", async 
 	const address = server.address()
 	assert(address && typeof address === "object")
 	const { plugin, restore } = await loadPlugin({
-		TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED: "1",
 		TAAS_REQUESTER_BRIDGE_POLL_INTERVAL_MS: "50",
 	})
 	try {

@@ -50,11 +50,21 @@ OpenClaw's `wrapStreamFn` hook intercepts the outbound request payload before it
 
 All metadata fields are no-overwrite: if the caller already supplied them, the plugin leaves them intact. Additionally, the plugin injects an `X-Session-Id` request header via the `resolveTransportTurnState` hook, for transport layers that support per-turn native headers.
 
-### Requester runtime capture
+### Requester runtime capture and bridge leasing
 
 The runtime envelope is intentionally small and sanitized. It can include `workspace_dir` / `agent_dir` when OpenClaw exposes them to the provider hook, bounded repo hints derived from the workspace (`repo_root_hint`, `repo_name`, `git_branch_hint`, `git_dirty_hint`), hashed host/source identifiers, and provider/model hints.
 
-It never includes raw environment variables, tokens, git remotes, full status output, diffs, or arbitrary provider `extraParams`. Git probes are bounded with a short timeout and the bridge capability list defaults to empty with `required_execution_mode = "advisory_only"`.
+It never includes raw environment variables, tokens, git remotes, full status output, diffs, or arbitrary provider `extraParams`. Git probes are bounded with a short timeout.
+
+For CloudSigma TaaS provider requests, bridge leasing is enabled by default. The plugin requests a short-lived requester bridge lease and forwards only the returned opaque descriptor in `requester_runtime.available_bridges`. If the lease service is unavailable, requests automatically fall back to advisory-only metadata with an empty bridge list.
+
+Default lease URL:
+
+```text
+https://taas.cloudsigma.com/internal/requester-bridges/leases
+```
+
+If the TaaS provider config exposes a custom `baseUrl`, the plugin derives the lease URL from that base. Set `TAAS_REQUESTER_BRIDGE_LEASE_URL` only for staging or custom deployments.
 
 ### Session ID derivation
 
@@ -205,7 +215,19 @@ Replace the ID with your actual session ID. A non-null response confirms TaaS ha
 
 ## Configuration
 
-None required. The plugin works out of the box with zero configuration.
+None required for standard CloudSigma TaaS use. The plugin works out of the box with zero configuration:
+
+- Bridge leasing is enabled by default for `cloudsigma` and `cloudsigma-staging` provider requests.
+- The standard lease endpoint is `https://taas.cloudsigma.com/internal/requester-bridges/leases`.
+- If the provider supplies a custom `baseUrl`, the lease URL is derived from that base instead.
+
+Optional environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED` | enabled | Set to `0`, `false`, `no`, or `off` to disable bridge leasing explicitly. |
+| `TAAS_REQUESTER_BRIDGE_LEASE_URL` | derived from provider base URL, then `https://taas.cloudsigma.com/internal/requester-bridges/leases` | Override only for staging/custom deployments. |
+| `TAAS_REQUESTER_BRIDGE_POLL_INTERVAL_MS` | `1000` | Poll interval for bridge operations. |
 
 ---
 
