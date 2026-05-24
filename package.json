@@ -1,27 +1,30 @@
 {
   "name": "openclaw-taas-affinity",
-  "version": "0.5.0",
-  "description": "OpenClaw provider plugin \u2014 CloudSigma TaaS session affinity. Injects a stable X-Session-Id header per conversation so TaaS can pin the session to the same OAuth token / Bedrock region / Claude Code node, maximising prompt-cache hit rates.",
+  "version": "0.5.1",
+  "description": "OpenClaw provider plugin — CloudSigma TaaS session affinity. Injects a stable X-Session-Id header per conversation so TaaS can pin the session to the same OAuth token / Bedrock region / Claude Code node, maximising prompt-cache hit rates.",
   "type": "module",
-  "main": "index.ts",
+  "main": "dist/index.js",
   "openclaw": {
     "extensions": [
-      "./index.ts"
+      "./dist/index.js"
     ],
     "providers": [
       "cloudsigma",
       "cloudsigma-staging"
     ],
     "compat": {
-      "pluginApi": ">=2026.5.24",
-      "minGatewayVersion": "2026.5.24"
+      "pluginApi": ">=2026.4.27",
+      "minGatewayVersion": "2026.4.27"
     },
     "build": {
-      "openclawVersion": "2026.5.24",
-      "pluginSdkVersion": "2026.5.24"
+      "openclawVersion": "2026.4.27",
+      "pluginSdkVersion": "2026.4.27"
     }
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build && npm test",
     "typecheck": "tsc --noEmit",
     "smoke": "node test/smoke.mjs",
     "unit": "node --import tsx --test test/*.test.ts",
@@ -38,12 +41,19 @@
   "author": "CloudSigma",
   "license": "MIT",
   "peerDependencies": {
-    "openclaw": ">=2026.5.24"
+    "openclaw": ">=2026.4.27"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "openclaw": "^2026.5.18",
     "tsx": "^4.20.0",
     "typescript": "^5.0.0"
-  }
+  },
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ]
 }

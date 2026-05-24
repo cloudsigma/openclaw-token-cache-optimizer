@@ -130,40 +130,49 @@ Older OpenClaw builds may fail to load the plugin or may load it without applyin
 
 ## Installation
 
-### Option 1 — ClaWHub (coming soon)
+### Option 1 - npm install (recommended)
 
 ```bash
 openclaw plugins install openclaw-token-cache-optimizer
 openclaw gateway restart
 ```
 
-### Option 2 — Manual
+The published npm package ships pre-built JavaScript in `dist/` and works on OpenClaw `2026.4.27` and later (see [Compatibility](#compatibility)).
+
+### Option 2 - Manual install from source
 
 ```bash
-# Clone into your OpenClaw extensions directory
 git clone https://github.com/cloudsigma/openclaw-token-cache-optimizer \
   ~/.openclaw/extensions/openclaw-token-cache-optimizer
-
-# Restart the gateway to load the plugin
+cd ~/.openclaw/extensions/openclaw-token-cache-optimizer
+npm install         # runs the `prepare` script which builds dist/
 openclaw gateway restart
 ```
 
-That's it. No `openclaw.json` changes are required — the plugin auto-activates for all requests to the `cloudsigma` provider.
+`npm install` triggers the `prepare` lifecycle script which compiles TypeScript to `dist/index.js`. OpenClaw `2026.5.x` and later require this compiled output for installed plugins; older gateways will still load it directly.
+
+That's it. No `openclaw.json` changes are required - the plugin auto-activates for all requests to the `cloudsigma` provider.
 
 ### Verify it loaded
 
 ```bash
 openclaw gateway status
+openclaw plugins info openclaw-taas-affinity
 ```
 
-You should see the plugin listed in the startup log:
-
-```
-[plugins] openclaw-token-cache-optimizer: loaded
-```
+You should see `Status: loaded` and the source pointing at `dist/index.js` (or `/index.ts` on legacy gateways).
 
 ---
 
+## Compatibility
+
+| OpenClaw gateway | Status | Notes |
+|---|---|---|
+| >= 2026.5.x | Supported | Loads compiled `dist/index.js` |
+| 2026.4.27 - 2026.4.x | Supported | Loads compiled `dist/index.js`; bridge polling endpoints may not exist on the gateway-side TaaS API yet - plugin falls back to advisory-only metadata |
+| < 2026.4.27 | Not supported | Hooks the plugin relies on (`wrapStreamFn`, `hookAliases`, `resolveTransportTurnState`) are not exposed |
+
+The plugin is **forward and backward compatible** within this range from a single build artefact: bridge leasing, polling, and result submission all degrade gracefully when the corresponding TaaS endpoints are missing.
 ## Verification
 
 ### Local validation
