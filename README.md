@@ -58,6 +58,8 @@ It never includes raw environment variables, tokens, git remotes, full status ou
 
 For CloudSigma TaaS provider requests, bridge leasing is enabled by default. The plugin requests a short-lived requester bridge lease and forwards only the returned opaque descriptor in `requester_runtime.available_bridges`. If the lease service is unavailable, requests automatically fall back to advisory-only metadata with an empty bridge list.
 
+The bridge is multi-tenant by design: proxy nodes receive only opaque descriptors and call TaaS; requester-owned tools execute in the requester runtime through this plugin's poller. Non-scaffold `requester.tool.invoke` operations are relayed to the requester-local OpenClaw Gateway `/tools/invoke` endpoint, not to any proxy-node backend. Use `TAAS_REQUESTER_LOCAL_GATEWAY_URL` / `TAAS_REQUESTER_LOCAL_GATEWAY_TOKEN` only on the requester host if its gateway is not reachable via the default local settings. The plugin falls back to `OPENCLAW_GATEWAY_URL`, `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD`, then `http://127.0.0.1:18789`.
+
 Default lease URL:
 
 ```text

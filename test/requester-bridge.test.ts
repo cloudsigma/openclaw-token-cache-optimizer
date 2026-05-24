@@ -258,3 +258,90 @@ test("plugin handles legacy openclaw.tool.invoke operation name in poll", async 
 		server.close()
 	}
 })
+
+test("plugin executes non-scaffold requester tools through requester-local gateway", async () => {
+	let pollCount = 0
+	let resultBody: any
+	let gatewayBody: any
+	const gateway = createServer((req, res) => {
+		let body = ""
+		req.on("data", (chunk) => { body += chunk })
+		req.on("end", () => {
+			gatewayBody = JSON.parse(body)
+			assert.equal(req.url, "/tools/invoke")
+			assert.equal(req.headers.authorization, "Bearer requester-token")
+			res.setHeader("Content-Type", "application/json")
+			res.end(JSON.stringify({ ok: true, result: { rows: [{ title: "PRD" }] } }))
+		})
+	})
+	await new Promise<void>((resolve) => gateway.listen(0, "127.0.0.1", resolve))
+	const gatewayAddress = gateway.address()
+	assert(gatewayAddress && typeof gatewayAddress === "object")
+
+	const taas = createServer((req, res) => {
+		let body = ""
+		req.on("data", (chunk) => { body += chunk })
+		req.on("end", () => {
+			res.setHeader("Content-Type", "application/json")
+			if (req.url === "/internal/requester-bridges/leases") {
+				res.end(JSON.stringify({
+					ok: true,
+					descriptor: {
+						name: "requester-workspace",
+						version: "2026-05-23",
+						status: "verified",
+						bridge_id: "br_test",
+						lease_id: "brl_tool",
+						capabilities: ["requester.tool.invoke"],
+						endpoint_ref: "epref_test",
+						auth_context_id: "authctx_test",
+						expires_at: "2026-05-23T19:00:00Z",
+					},
+				}))
+				return
+			}
+			if (req.url === "/internal/requester-bridges/poll") {
+				pollCount += 1
+				res.end(JSON.stringify({
+					ok: true,
+					operations: pollCount === 1 ? [{
+						operation_id: "bro_tool",
+						audit_id: "bra_tool",
+						lease_id: "brl_tool",
+						bridge_id: "br_test",
+						operation: "requester.tool.invoke",
+						arguments: { tool: "prd_list", arguments: { query: "requester bridge" } },
+					}] : [],
+				}))
+				return
+			}
+			if (req.url === "/internal/requester-bridges/results") {
+				resultBody = JSON.parse(body)
+				res.end(JSON.stringify({ ok: true }))
+				return
+			}
+			res.statusCode = 404
+			res.end(JSON.stringify({ ok: false }))
+		})
+	})
+	await new Promise<void>((resolve) => taas.listen(0, "127.0.0.1", resolve))
+	const taasAddress = taas.address()
+	assert(taasAddress && typeof taasAddress === "object")
+	const { plugin, restore } = await loadPlugin({
+		TAAS_REQUESTER_BRIDGE_POLL_INTERVAL_MS: "50",
+		TAAS_REQUESTER_LOCAL_GATEWAY_URL: `http://127.0.0.1:${gatewayAddress.port}`,
+		TAAS_REQUESTER_LOCAL_GATEWAY_TOKEN: "requester-token",
+	})
+	try {
+		await runPayload(captureWrapper(plugin), { messages: [] }, { baseUrl: `http://127.0.0.1:${taasAddress.port}` })
+		await new Promise((resolve) => setTimeout(resolve, 150))
+		assert.deepEqual(gatewayBody, { tool: "prd_list", args: { query: "requester bridge" } })
+		assert.equal(resultBody.operation_id, "bro_tool")
+		assert.equal(resultBody.ok, true)
+		assert.deepEqual(resultBody.result, { rows: [{ title: "PRD" }] })
+	} finally {
+		restore()
+		taas.close()
+		gateway.close()
+	}
+})
