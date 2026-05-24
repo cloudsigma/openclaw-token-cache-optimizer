@@ -345,3 +345,174 @@ test("plugin executes non-scaffold requester tools through requester-local gatew
 		gateway.close()
 	}
 })
+
+test("plugin includes claim_id in result submission when poll returns one", async () => {
+	let pollCount = 0
+	let resultBody: any
+	const server = createServer((req, res) => {
+		let body = ""
+		req.on("data", (chunk) => { body += chunk })
+		req.on("end", () => {
+			res.setHeader("Content-Type", "application/json")
+			if (req.url === "/internal/requester-bridges/leases") {
+				res.end(JSON.stringify({
+					ok: true,
+					descriptor: {
+						name: "requester-workspace",
+						version: "2026-05-23",
+						status: "verified",
+						bridge_id: "br_test",
+						lease_id: "brl_claim",
+						capabilities: ["requester.tool.invoke"],
+						endpoint_ref: "epref_test",
+						auth_context_id: "authctx_test",
+						expires_at: "2026-05-23T19:00:00Z",
+					},
+				}))
+				return
+			}
+			if (req.url === "/internal/requester-bridges/poll") {
+				pollCount += 1
+				res.end(JSON.stringify({
+					ok: true,
+					operations: pollCount === 1 ? [{
+						operation_id: "bro_claim",
+						audit_id: "bra_claim",
+						lease_id: "brl_claim",
+						bridge_id: "br_test",
+						operation: "requester.tool.invoke",
+						arguments: { tool: "bridge.ping" },
+						claim_id: "brc_abc123claim",
+						claim_expires_at: "2026-05-23T20:00:00Z",
+						delivery_attempt: 1,
+					}] : [],
+				}))
+				return
+			}
+			if (req.url === "/internal/requester-bridges/results") {
+				resultBody = JSON.parse(body)
+				res.end(JSON.stringify({ ok: true }))
+				return
+			}
+			res.statusCode = 404
+			res.end(JSON.stringify({ ok: false }))
+		})
+	})
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+	const address = server.address()
+	assert(address && typeof address === "object")
+	const { plugin, restore } = await loadPlugin({
+		TAAS_REQUESTER_BRIDGE_POLL_INTERVAL_MS: "50",
+	})
+	try {
+		await runPayload(captureWrapper(plugin), { messages: [] }, { baseUrl: `http://127.0.0.1:${address.port}` })
+		await new Promise((resolve) => setTimeout(resolve, 150))
+		assert.equal(resultBody.operation_id, "bro_claim")
+		assert.equal(resultBody.claim_id, "brc_abc123claim")
+		assert.equal(resultBody.ok, true)
+	} finally {
+		restore()
+		server.close()
+	}
+})
+
+test("plugin stops polling stale leases on lease_expired_or_unknown", async () => {
+	let pollCount = 0
+	const server = createServer((req, res) => {
+		let body = ""
+		req.on("data", (chunk) => { body += chunk })
+		req.on("end", () => {
+			void body
+			res.setHeader("Content-Type", "application/json")
+			if (req.url === "/internal/requester-bridges/leases") {
+				res.end(JSON.stringify({
+					ok: true,
+					descriptor: {
+						name: "requester-workspace",
+						version: "2026-05-23",
+						status: "verified",
+						bridge_id: "br_test",
+						lease_id: "brl_stale",
+						capabilities: ["requester.tool.invoke"],
+						endpoint_ref: "epref_test",
+						auth_context_id: "authctx_test",
+						expires_at: "2026-05-23T19:00:00Z",
+					},
+				}))
+				return
+			}
+			if (req.url === "/internal/requester-bridges/poll") {
+				pollCount += 1
+				res.statusCode = 404
+				res.end(JSON.stringify({ ok: false, error: { code: "lease_expired_or_unknown" } }))
+				return
+			}
+			res.statusCode = 404
+			res.end(JSON.stringify({ ok: false }))
+		})
+	})
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+	const address = server.address()
+	assert(address && typeof address === "object")
+	const { plugin, restore } = await loadPlugin({
+		TAAS_REQUESTER_BRIDGE_POLL_INTERVAL_MS: "50",
+	})
+	try {
+		await runPayload(captureWrapper(plugin), { messages: [] }, { baseUrl: `http://127.0.0.1:${address.port}` })
+		await new Promise((resolve) => setTimeout(resolve, 220))
+		assert.equal(pollCount, 1)
+	} finally {
+		restore()
+		server.close()
+	}
+})
+
+test("plugin sends wait_ms in poll request for long-polling", async () => {
+	let pollBody: any
+	const server = createServer((req, res) => {
+		let body = ""
+		req.on("data", (chunk) => { body += chunk })
+		req.on("end", () => {
+			res.setHeader("Content-Type", "application/json")
+			if (req.url === "/internal/requester-bridges/leases") {
+				res.end(JSON.stringify({
+					ok: true,
+					descriptor: {
+						name: "requester-workspace",
+						version: "2026-05-23",
+						status: "verified",
+						bridge_id: "br_test",
+						lease_id: "brl_wait",
+						capabilities: ["requester.tool.invoke"],
+						endpoint_ref: "epref_test",
+						auth_context_id: "authctx_test",
+						expires_at: "2026-05-23T19:00:00Z",
+					},
+				}))
+				return
+			}
+			if (req.url === "/internal/requester-bridges/poll") {
+				pollBody = JSON.parse(body)
+				res.end(JSON.stringify({ ok: true, operations: [] }))
+				return
+			}
+			res.statusCode = 404
+			res.end(JSON.stringify({ ok: false }))
+		})
+	})
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+	const address = server.address()
+	assert(address && typeof address === "object")
+	const { plugin, restore } = await loadPlugin({
+		TAAS_REQUESTER_BRIDGE_POLL_INTERVAL_MS: "50",
+	})
+	try {
+		await runPayload(captureWrapper(plugin), { messages: [] }, { baseUrl: `http://127.0.0.1:${address.port}` })
+		await new Promise((resolve) => setTimeout(resolve, 150))
+		assert.equal(pollBody.wait_ms, 25000)
+		assert.equal(pollBody.max_operations, 10)
+	} finally {
+		restore()
+		server.close()
+	}
+})

@@ -67,9 +67,12 @@ type BridgePollOperation = {
 	bridge_id?: unknown
 	operation?: unknown
 	arguments?: unknown
+	claim_id?: unknown
+	claim_expires_at?: unknown
+	delivery_attempt?: unknown
 }
 
-type PollerState = { timer?: NodeJS.Timeout; inFlight: boolean }
+type PollerState = { timer?: NodeJS.Timeout; inFlight: boolean; stopped?: boolean; leaseId?: string }
 
 // OpenClaw stores the active registry state (including workspaceDir) on globalThis
 // under this well-known symbol key.
@@ -391,6 +394,7 @@ async function postBridgeResult(resultsUrl: string, descriptor: Record<string, u
 	const controller = new AbortController()
 	const timer = setTimeout(() => controller.abort(), POLL_REQUEST_TIMEOUT_MS)
 	try {
+		const claimId = typeof operation.claim_id === "string" ? operation.claim_id : undefined
 		await fetch(resultsUrl, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
@@ -401,6 +405,7 @@ async function postBridgeResult(resultsUrl: string, descriptor: Record<string, u
 				auth_context_id: descriptor.auth_context_id,
 				operation_id: operation.operation_id,
 				audit_id: operation.audit_id,
+				...(claimId && { claim_id: claimId }),
 				...outcome,
 			}),
 			signal: controller.signal,
@@ -412,11 +417,22 @@ async function postBridgeResult(resultsUrl: string, descriptor: Record<string, u
 	}
 }
 
+const DEFAULT_POLL_WAIT_MS = 25_000
+
+function stopRequesterBridgePoller(leaseId?: string): void {
+	if (!leaseId) return
+	const state = activePollers.get(leaseId)
+	if (!state) return
+	state.stopped = true
+	if (state.timer) clearInterval(state.timer)
+	activePollers.delete(leaseId)
+}
+
 async function pollRequesterBridgeOnce(pollUrl: string, resultsUrl: string, descriptor: Record<string, unknown>, state: PollerState): Promise<void> {
-	if (state.inFlight) return
+	if (state.inFlight || state.stopped) return
 	state.inFlight = true
 	const controller = new AbortController()
-	const timer = setTimeout(() => controller.abort(), POLL_REQUEST_TIMEOUT_MS)
+	const timer = setTimeout(() => controller.abort(), Math.max(POLL_REQUEST_TIMEOUT_MS, DEFAULT_POLL_WAIT_MS + 5_000))
 	try {
 		const response = await fetch(pollUrl, {
 			method: "POST",
@@ -427,10 +443,21 @@ async function pollRequesterBridgeOnce(pollUrl: string, resultsUrl: string, desc
 				bridge_id: descriptor.bridge_id,
 				auth_context_id: descriptor.auth_context_id,
 				max_operations: 10,
+				wait_ms: DEFAULT_POLL_WAIT_MS,
 			}),
 			signal: controller.signal,
 		})
-		if (!response.ok) return
+		if (!response.ok) {
+			const json = await response.json().catch(() => undefined) as { error?: { code?: unknown } } | undefined
+			const code = safeString(json?.error?.code)
+			if (response.status === 404 || code === "lease_expired_or_unknown") {
+				// Lease state is server/cache-owned and can disappear on rollout or TTL expiry.
+				// Stop polling this dead lease immediately; the next provider turn will create
+				// a fresh lease instead of hammering TaaS/Redis with stale IDs.
+				stopRequesterBridgePoller(state.leaseId ?? safeString(descriptor.lease_id))
+			}
+			return
+		}
 		const json = await response.json() as { operations?: unknown }
 		const operations = Array.isArray(json.operations) ? json.operations : []
 		for (const raw of operations) {
@@ -453,7 +480,7 @@ function startRequesterBridgePoller(leaseUrl: string, descriptor: Record<string,
 	const pollUrl = bridgeSiblingUrl(leaseUrl, REQUESTER_BRIDGE_POLL_PATH)
 	const resultsUrl = bridgeSiblingUrl(leaseUrl, REQUESTER_BRIDGE_RESULTS_PATH)
 	if (!pollUrl || !resultsUrl) return
-	const state: PollerState = { inFlight: false }
+	const state: PollerState = { inFlight: false, leaseId }
 	activePollers.set(leaseId, state)
 	const tick = () => { void pollRequesterBridgeOnce(pollUrl, resultsUrl, descriptor, state) }
 	state.timer = setInterval(tick, pollIntervalMs())
