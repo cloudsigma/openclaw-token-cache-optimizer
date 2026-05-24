@@ -31,7 +31,8 @@ const REQUESTER_BRIDGE_PLUGIN_FLAG = "TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED"
 const REQUESTER_BRIDGE_LEASE_PATH = "/internal/requester-bridges/leases"
 const REQUESTER_BRIDGE_POLL_PATH = "/internal/requester-bridges/poll"
 const REQUESTER_BRIDGE_RESULTS_PATH = "/internal/requester-bridges/results"
-const REQUESTER_BRIDGE_CAPABILITY = "openclaw.tool.invoke"
+const REQUESTER_BRIDGE_CAPABILITY = "requester.tool.invoke"
+const REQUESTER_BRIDGE_CAPABILITY_LEGACY = "openclaw.tool.invoke"
 const REQUESTER_BRIDGE_DEFAULT_TTL_SECONDS = 5 * 60
 const GIT_PROBE_TIMEOUT_MS = 250
 const LEASE_REQUEST_TIMEOUT_MS = 1200
@@ -327,7 +328,7 @@ function boundedJson(value: unknown): unknown {
 }
 
 async function executeSafeBridgeOperation(operation: BridgePollOperation): Promise<{ ok: true; result: unknown } | { ok: false; error: { code: string; message: string } }> {
-	if (operation.operation !== REQUESTER_BRIDGE_CAPABILITY) {
+	if (operation.operation !== REQUESTER_BRIDGE_CAPABILITY && operation.operation !== REQUESTER_BRIDGE_CAPABILITY_LEGACY) {
 		return { ok: false, error: { code: "unsupported_operation", message: "Unsupported requester bridge operation" } }
 	}
 	const args = asRecord(operation.arguments) ?? {}
@@ -421,7 +422,7 @@ function isSafeDescriptor(value: unknown): value is Record<string, unknown> {
 	if (!descriptor) return false
 	if ("bridge_required" in descriptor) return false
 	const capabilities = descriptor.capabilities
-	if (!Array.isArray(capabilities) || capabilities.includes(REQUESTER_BRIDGE_CAPABILITY) === false) {
+	if (!Array.isArray(capabilities) || (capabilities.includes(REQUESTER_BRIDGE_CAPABILITY) === false && capabilities.includes(REQUESTER_BRIDGE_CAPABILITY_LEGACY) === false)) {
 		return false
 	}
 	const encoded = JSON.stringify(descriptor)
