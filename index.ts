@@ -40,6 +40,7 @@ const GIT_PROBE_TIMEOUT_MS = 250
 const LEASE_REQUEST_TIMEOUT_MS = 1200
 const POLL_REQUEST_TIMEOUT_MS = 1200
 const DEFAULT_POLL_INTERVAL_MS = 1000
+const DEFAULT_GATEWAY_URL = "http://127.0.0.1:18789"
 const MAX_ECHO_BYTES = 4096
 
 type RequesterRuntime = Record<string, unknown>
@@ -328,20 +329,62 @@ function boundedJson(value: unknown): unknown {
 	return { truncated: true, message: "echo payload exceeded bridge scaffold size limit" }
 }
 
+function requesterGatewayUrl(): string {
+	return safeString(process.env.TAAS_REQUESTER_LOCAL_GATEWAY_URL)
+		?? safeString(process.env.OPENCLAW_GATEWAY_URL)
+		?? (safeString(process.env.OPENCLAW_GATEWAY_PORT) ? `http://127.0.0.1:${process.env.OPENCLAW_GATEWAY_PORT}` : DEFAULT_GATEWAY_URL)
+}
+
+function requesterGatewayToken(): string | undefined {
+	return safeString(process.env.TAAS_REQUESTER_LOCAL_GATEWAY_TOKEN)
+		?? safeString(process.env.OPENCLAW_GATEWAY_TOKEN)
+		?? safeString(process.env.OPENCLAW_GATEWAY_PASSWORD)
+}
+
+async function invokeRequesterLocalTool(tool: string, args: Record<string, unknown>): Promise<{ ok: true; result: unknown } | { ok: false; error: { code: string; message: string } }> {
+	const controller = new AbortController()
+	const timer = setTimeout(() => controller.abort(), POLL_REQUEST_TIMEOUT_MS)
+	try {
+		const headers: Record<string, string> = { "Content-Type": "application/json" }
+		const token = requesterGatewayToken()
+		if (token) headers.Authorization = `Bearer ${token}`
+		const response = await fetch(`${requesterGatewayUrl().replace(/\/+$/, "")}/tools/invoke`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ tool, args }),
+			signal: controller.signal,
+		})
+		const json = await response.json().catch(() => undefined) as { ok?: boolean; result?: unknown; error?: { type?: string; code?: string; message?: string } } | undefined
+		if (!response.ok || !json || json.ok !== true) {
+			const code = json?.error?.code ?? json?.error?.type ?? `http_${response.status}`
+			const message = json?.error?.message ?? `Requester local tool invoke failed: ${code}`
+			return { ok: false, error: { code, message } }
+		}
+		return { ok: true, result: json.result }
+	} catch (err) {
+		const name = err instanceof Error && err.name ? err.name : "requester_tool_invoke_failed"
+		const message = err instanceof Error && err.message ? err.message : String(err)
+		return { ok: false, error: { code: name, message } }
+	} finally {
+		clearTimeout(timer)
+	}
+}
+
 async function executeSafeBridgeOperation(operation: BridgePollOperation): Promise<{ ok: true; result: unknown } | { ok: false; error: { code: string; message: string } }> {
 	if (operation.operation !== REQUESTER_BRIDGE_CAPABILITY && operation.operation !== REQUESTER_BRIDGE_CAPABILITY_LEGACY) {
 		return { ok: false, error: { code: "unsupported_operation", message: "Unsupported requester bridge operation" } }
 	}
 	const args = asRecord(operation.arguments) ?? {}
-	const tool = safeString(args.tool) ?? safeString(args.name)
+	const tool = safeString(args.tool) ?? safeString(args.tool_name) ?? safeString(args.name)
 	const toolArgs = asRecord(args.arguments) ?? asRecord(args.input) ?? {}
+	if (!tool) return { ok: false, error: { code: "missing_tool", message: "Requester bridge operation missing tool name" } }
 	if (tool === "bridge.ping") {
 		return { ok: true, result: { pong: true, echo: boundedJson(toolArgs), scaffold: true } }
 	}
 	if (tool === "bridge.echo") {
 		return { ok: true, result: { echo: boundedJson(toolArgs), scaffold: true } }
 	}
-	return { ok: false, error: { code: "tool_not_available", message: "Requester bridge scaffold only supports bridge.ping and bridge.echo" } }
+	return invokeRequesterLocalTool(tool, toolArgs)
 }
 
 async function postBridgeResult(resultsUrl: string, descriptor: Record<string, unknown>, operation: BridgePollOperation, outcome: Awaited<ReturnType<typeof executeSafeBridgeOperation>>): Promise<void> {
