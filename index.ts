@@ -435,6 +435,11 @@ const STATUS_PATH = process.env.TAAS_AFFINITY_RUNS_STATUS_PATH
 	|| path.join(os.homedir(), ".openclaw", "alien-studio", "runs-status.json")
 
 // ── Zombie auto-abort configuration ───────────────────────────────────────────
+// ⚠️  PLUGIN BLOCKED: No plugin-side dispatch for chat.abort exists in the OpenClaw
+//     plugin SDK. The default abortRun function logs a warning and is a no-op.
+//     When the SDK adds api.runtime.chat.abort() or dispatchGatewayMethod(),
+//     replace the default abortRun in register() below.
+//     Set TAAS_AFFINITY_AUTO_ABORT_ZOMBIES=true to enable (currently opt-in).
 const AUTO_ABORT_ENABLED = process.env.TAAS_AFFINITY_AUTO_ABORT_ZOMBIES === "true"
 const AUTO_ABORT_DRY_RUN = process.env.TAAS_AFFINITY_AUTO_ABORT_DRY_RUN === "true"
 const AUTO_ABORT_THRESHOLD_MS = Number(process.env.TAAS_AFFINITY_AUTO_ABORT_THRESHOLD_MS) || STATUS_ZOMBIE_MS
