@@ -872,7 +872,8 @@ export default {
 					directSessionId ?? resolveSessionId(workspaceDir).sessionId
 				const captured = getLastRouteForSession(resolvedSessionId)
 				respond(true, { sessionId: resolvedSessionId, capture: captured })
-			}
+			},
+			{ scope: "operator.read" }
 		)
 	},
 }
