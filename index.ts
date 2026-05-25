@@ -614,6 +614,85 @@ async function patchPayloadMetadata(
 	}
 }
 
+/**
+ * Captured autorouter metadata per-session, populated by the onResponse callback
+ * installed in `buildWrapper`. Exposed via the `taas.autorouter.lastRoute` gateway
+ * RPC so Alien AI Studio (or any other client) can pull the latest TaaS routing
+ * decision for a session — including the actual model chosen by the autorouter,
+ * the algorithm used, the source of that algorithm (org/dept/key/user/system),
+ * the thinking level applied, and the chosen model's context window.
+ *
+ * The map is keyed by the affinity session ID we already derive in
+ * `resolveSessionId(ctx.workspaceDir)`. Stored values are bounded — see
+ * `LAST_ROUTE_LIMIT` — to avoid unbounded growth in long-lived gateways.
+ */
+type AutorouterCapture = {
+	sessionId: string
+	capturedAt: number
+	autorouterModel: string | null
+	autorouterAlgo: string | null
+	autorouterAlgoSource: string | null
+	thinkingApplied: string | null
+	routedContextWindow: number | null
+}
+
+const LAST_ROUTE_LIMIT = 256
+const lastRouteBySessionId = new Map<string, AutorouterCapture>()
+
+function pruneLastRouteMap(): void {
+	if (lastRouteBySessionId.size <= LAST_ROUTE_LIMIT) return
+	// Drop oldest entries by capturedAt ascending until we're back under the cap.
+	const entries = [...lastRouteBySessionId.entries()].sort(
+		(a, b) => a[1].capturedAt - b[1].capturedAt
+	)
+	const toDrop = entries.length - LAST_ROUTE_LIMIT
+	for (let i = 0; i < toDrop; i++) {
+		lastRouteBySessionId.delete(entries[i][0])
+	}
+}
+
+function captureAutorouterFromHeaders(
+	sessionId: string,
+	headers: Record<string, string>
+): void {
+	// Header names from TaaS proxy are emitted in canonical "X-TaaS-*" form
+	// but Node/undici lowercases incoming response headers. Read case-insensitively.
+	const lowered: Record<string, string> = {}
+	for (const [k, v] of Object.entries(headers)) {
+		if (typeof v === "string") lowered[k.toLowerCase()] = v
+	}
+	const autorouted = lowered["x-taas-autorouted"]
+	if (autorouted !== "true") return // ignore non-autorouted responses
+	const capture: AutorouterCapture = {
+		sessionId,
+		capturedAt: Date.now(),
+		autorouterModel: lowered["x-taas-autorouter-model"] ?? null,
+		autorouterAlgo: lowered["x-taas-autorouter-mode"] ?? null,
+		autorouterAlgoSource: lowered["x-taas-autorouter-algorithm-source"] ?? null,
+		thinkingApplied: lowered["x-taas-thinking-applied"] ?? null,
+		routedContextWindow: (() => {
+			const raw = lowered["x-taas-routed-context-window"]
+			if (!raw) return null
+			const n = Number(raw)
+			return Number.isFinite(n) && n > 0 ? n : null
+		})(),
+	}
+	lastRouteBySessionId.set(sessionId, capture)
+	pruneLastRouteMap()
+	if (isDev) {
+		console.debug(
+			`[taas-affinity] captured autorouter sessionId=${sessionId} ` +
+				`model=${capture.autorouterModel} algo=${capture.autorouterAlgo} ` +
+				`source=${capture.autorouterAlgoSource} thinking=${capture.thinkingApplied} ` +
+				`ctxWindow=${capture.routedContextWindow}`
+		)
+	}
+}
+
+function getLastRouteForSession(sessionId: string): AutorouterCapture | null {
+	return lastRouteBySessionId.get(sessionId) ?? null
+}
+
 function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 	const { streamFn } = ctx
 	if (!streamFn) return undefined
@@ -642,7 +721,23 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 			if (prevOnPayload) return prevOnPayload(patched, payloadModel)
 			return patched
 		}
-		return inner(model, context, { ...options, onPayload })
+		const prevOnResponse = options?.onResponse
+		const onResponse: NonNullable<typeof options>["onResponse"] = async (
+			response,
+			responseModel
+		) => {
+			try {
+				captureAutorouterFromHeaders(sessionId, response?.headers ?? {})
+			} catch (err) {
+				if (isDev) {
+					console.debug(
+						`[taas-affinity] onResponse capture failed: ${(err as Error)?.message ?? err}`
+					)
+				}
+			}
+			if (prevOnResponse) await prevOnResponse(response, responseModel)
+		}
+		return inner(model, context, { ...options, onPayload, onResponse })
 	} as typeof inner
 }
 
@@ -700,5 +795,27 @@ export default {
 			wrapStreamFn: buildWrapper,
 			resolveTransportTurnState: buildTransportTurnState,
 		})
+
+		// Expose captured TaaS autorouter metadata to gateway clients (Studio, etc.).
+		// The Alien AI Studio polls this after each turn to populate the model/algo/
+		// thinking/context-window fields in the AgentChatPanel for cloudsigma/auto and
+		// other autorouted requests. See PRD "Alien AI Studio - Auto-Routing Model UX"
+		// (Confluence 1901363271).
+		if (typeof api.registerGatewayMethod === "function") api.registerGatewayMethod(
+			"taas.autorouter.lastRoute",
+			async ({ params, respond }) => {
+				// Accept either { workspaceDir } (preferred — derives sessionId the
+				// same way the wrapper does) or { sessionId } (direct lookup).
+				const p = (params ?? {}) as Record<string, unknown>
+				const directSessionId =
+					typeof p.sessionId === "string" ? p.sessionId : null
+				const workspaceDir =
+					typeof p.workspaceDir === "string" ? p.workspaceDir : undefined
+				const resolvedSessionId =
+					directSessionId ?? resolveSessionId(workspaceDir).sessionId
+				const captured = getLastRouteForSession(resolvedSessionId)
+				respond(true, { sessionId: resolvedSessionId, capture: captured })
+			}
+		)
 	},
 }
