@@ -160,3 +160,67 @@ await registeredHandler({
 })
 
 console.log("autorouter capture smoke ok")
+
+// === per-agent keying ===
+// When the Studio passes { agentId }, the plugin should return the capture
+// stored under that agent's key (derived from agentDir/workspaceDir or env).
+{
+	// First simulate a capture happening for an agent named "new-agent-3"
+	const agentWrapped = provider.wrapStreamFn({
+		streamFn: async (_m, _c, options = {}) => {
+			if (options.onResponse) {
+				await options.onResponse(
+					{
+						status: 200,
+						headers: {
+							"x-taas-autorouted": "true",
+							"x-taas-autorouter-model": "cloudsigma/gpt-5-mini",
+							"x-taas-autorouter-mode": "price_performance",
+							"x-taas-autorouter-algorithm-source": "user_default",
+							"x-taas-thinking-applied": "low",
+							"x-taas-routed-context-window": "200000",
+						},
+					},
+					_m
+				)
+			}
+		},
+		workspaceDir: "/home/cloudsigma/.openclaw/workspace-new-agent-3",
+		agentDir: "/home/cloudsigma/.openclaw/workspace-new-agent-3",
+		provider: "cloudsigma",
+		modelId: "cloudsigma/auto",
+		model: { id: "cloudsigma/auto" },
+	})
+	await agentWrapped("model", { messages: [] }, {})
+
+	// Now ask via { agentId: "new-agent-3" }
+	let agentPayload
+	await registeredHandler({
+		req: { id: "t-agent" },
+		params: { agentId: "new-agent-3" },
+		client: null,
+		isWebchatConnect: () => false,
+		respond: (_ok, payload) => { agentPayload = payload },
+		context: {},
+	})
+	assert.ok(agentPayload?.capture, "agentId lookup returned a capture")
+	assert.equal(agentPayload.agentId, "new-agent-3")
+	assert.equal(agentPayload.capture.autorouterModel, "cloudsigma/gpt-5-mini")
+	assert.equal(agentPayload.capture.autorouterAlgo, "price_performance")
+	assert.equal(agentPayload.capture.routedContextWindow, 200000)
+
+	// And a non-matching agentId returns null capture
+	let missPayload
+	await registeredHandler({
+		req: { id: "t-miss" },
+		params: { agentId: "no-such-agent" },
+		client: null,
+		isWebchatConnect: () => false,
+		respond: (_ok, payload) => { missPayload = payload },
+		context: {},
+	})
+	assert.equal(missPayload.agentId, "no-such-agent")
+	assert.equal(missPayload.capture, null, "miss returns null capture")
+}
+
+console.log("per-agent keying smoke ok")
