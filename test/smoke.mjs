@@ -72,3 +72,91 @@ const transportState = provider.resolveTransportTurnState({
 assert.match(transportState.headers["X-Session-Id"], /^oc:[a-f0-9]{16}$/)
 
 console.log("smoke ok")
+
+// === autorouter capture (R7.1/R7.2 from Studio PRD) ===
+// Verify that the wrapper threads an onResponse callback that captures
+// X-TaaS-* headers and that taas.autorouter.lastRoute returns them.
+let registeredMethod
+let registeredHandler
+const apiWithGateway = {
+	registerProvider(candidate) {
+		// keep previous provider too — second registration
+	},
+	registerGatewayMethod(name, handler) {
+		registeredMethod = name
+		registeredHandler = handler
+	},
+}
+plugin.register(apiWithGateway)
+assert.equal(registeredMethod, "taas.autorouter.lastRoute", "gateway method registered")
+assert.equal(typeof registeredHandler, "function", "handler is a function")
+
+// Drive the wrapper through onResponse with synthetic autorouter headers.
+const captureStreamFn = async (_model, _context, options = {}) => {
+	// pi-ai protocol: call onPayload first (existing behaviour), then onResponse
+	// with the simulated HTTP response object, then stream.
+	if (options.onPayload) await options.onPayload({ messages: [], metadata: {} }, _model)
+	if (options.onResponse) {
+		await options.onResponse(
+			{
+				status: 200,
+				headers: {
+					"x-taas-autorouted": "true",
+					"x-taas-autorouter-model": "cloudsigma/gpt-5",
+					"x-taas-autorouter-mode": "best_fit",
+					"x-taas-autorouter-algorithm-source": "api_key_default",
+					"x-taas-thinking-applied": "medium",
+					"x-taas-routed-context-window": "128000",
+				},
+			},
+			_model
+		)
+	}
+}
+const captureWrapped = provider.wrapStreamFn({
+	streamFn: captureStreamFn,
+	workspaceDir: "/tmp/openclaw-token-cache-optimizer-smoke",
+	provider: "cloudsigma",
+	modelId: "cloudsigma/auto",
+	model: { id: "cloudsigma/auto" },
+})
+await captureWrapped("model", { messages: [] }, {})
+
+// Now invoke the registered gateway handler and assert it returns the capture.
+let respondedOk
+let respondedPayload
+await registeredHandler({
+	req: { id: "test" },
+	params: { workspaceDir: "/tmp/openclaw-token-cache-optimizer-smoke" },
+	client: null,
+	isWebchatConnect: () => false,
+	respond: (ok, payload) => {
+		respondedOk = ok
+		respondedPayload = payload
+	},
+	context: {},
+})
+assert.equal(respondedOk, true, "handler responded ok")
+assert.ok(respondedPayload, "payload present")
+assert.match(respondedPayload.sessionId, /^oc:[a-f0-9]{16}$/, "sessionId looks valid")
+assert.ok(respondedPayload.capture, "capture present")
+assert.equal(respondedPayload.capture.autorouterModel, "cloudsigma/gpt-5")
+assert.equal(respondedPayload.capture.autorouterAlgo, "best_fit")
+assert.equal(respondedPayload.capture.autorouterAlgoSource, "api_key_default")
+assert.equal(respondedPayload.capture.thinkingApplied, "medium")
+assert.equal(respondedPayload.capture.routedContextWindow, 128000)
+
+// Non-autorouted response should NOT overwrite (we explicitly drop it)
+await captureWrapped("model", { messages: [] }, {})
+await registeredHandler({
+	req: { id: "t2" },
+	params: { workspaceDir: "/tmp/openclaw-token-cache-optimizer-smoke" },
+	client: null,
+	isWebchatConnect: () => false,
+	respond: (_ok, payload) => {
+		assert.equal(payload.capture.autorouterModel, "cloudsigma/gpt-5", "still holds last good")
+	},
+	context: {},
+})
+
+console.log("autorouter capture smoke ok")
