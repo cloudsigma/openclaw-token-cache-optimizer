@@ -434,6 +434,35 @@ const STATUS_ZOMBIE_MS = 60 * 60_000
 const STATUS_PATH = process.env.TAAS_AFFINITY_RUNS_STATUS_PATH
 	|| path.join(os.homedir(), ".openclaw", "alien-studio", "runs-status.json")
 
+// ── Zombie auto-abort configuration ───────────────────────────────────────────
+// ⚠️  PLUGIN BLOCKED: No plugin-side dispatch for chat.abort exists in the OpenClaw
+//     plugin SDK. The default abortRun function logs a warning and is a no-op.
+//     When the SDK adds api.runtime.chat.abort() or dispatchGatewayMethod(),
+//     replace the default abortRun in register() below.
+//     Set TAAS_AFFINITY_AUTO_ABORT_ZOMBIES=true to enable (currently opt-in).
+const AUTO_ABORT_ENABLED = process.env.TAAS_AFFINITY_AUTO_ABORT_ZOMBIES === "true"
+const AUTO_ABORT_DRY_RUN = process.env.TAAS_AFFINITY_AUTO_ABORT_DRY_RUN === "true"
+const AUTO_ABORT_THRESHOLD_MS = Number(process.env.TAAS_AFFINITY_AUTO_ABORT_THRESHOLD_MS) || STATUS_ZOMBIE_MS
+const AUTO_ABORT_CHECK_INTERVAL_MS = Number(process.env.TAAS_AFFINITY_AUTO_ABORT_CHECK_INTERVAL_MS) || 60_000
+const AUTO_ABORT_ABORTED_SET_MAX = 1000
+
+/** In-memory set of sessionKeys already aborted in this process (LRU-bounded). */
+const abortedInThisProcess: string[] = []
+
+/**
+ * Injected abort function. Default logs a warning because the plugin SDK does not
+ * expose a way to dispatch chat.abort from inside a plugin. Replace via
+ * setAbortRunFn() in tests or when the SDK adds the capability.
+ */
+let abortRun: (sessionKey: string) => Promise<void> = async (sessionKey: string) => {
+	console.warn("[taas-affinity] auto-abort: chat.abort not available via plugin SDK; sessionKey=" + sessionKey)
+}
+
+/** Replace the abort function (for testing or future SDK integration). */
+function setAbortRunFn(fn: (sessionKey: string) => Promise<void>): void {
+	abortRun = fn
+}
+
 function stopRequesterBridgePoller(leaseId?: string): void {
 	if (!leaseId) return
 	const state = activePollers.get(leaseId)
@@ -894,6 +923,94 @@ function writeRunStatus(agentsDir?: string, statusPath?: string): void {
 	}
 }
 
+// ── Zombie auto-abort ──────────────────────────────────────────────────────────
+let abortCheckInProgress = false
+
+function runAbortCheck(agentsDir?: string): void {
+	if (abortCheckInProgress) return
+	abortCheckInProgress = true
+	try {
+		const base = agentsDir || path.join(os.homedir(), ".openclaw", "agents")
+		let agents: string[]
+		try { agents = fs.readdirSync(base) } catch { agents = [] }
+
+		const zombies: Array<{ sessionKey: string; idleMs: number }> = []
+
+		for (const agentId of agents) {
+			const sessionsDir = path.join(base, agentId, "sessions")
+			let entries: string[]
+			try { entries = fs.readdirSync(sessionsDir) } catch { continue }
+
+			let mainKey: string | null = null
+			try {
+				const idJson = fs.readFileSync(path.join(base, agentId, "agent", "identity.json"), "utf8")
+				const parsed = JSON.parse(idJson)
+				if (typeof parsed.mainKey === "string") mainKey = parsed.mainKey
+			} catch { /* no identity file */ }
+
+			let mainUuid: string | null = null
+			if (mainKey) {
+				const parts = mainKey.split(":")
+				const lastPart = parts[parts.length - 1]
+				if (lastPart !== "main" && lastPart.length >= 8) {
+					mainUuid = lastPart
+				}
+			}
+
+			for (const name of entries) {
+				if (!name.endsWith(".jsonl.lock")) continue
+				const sessionUuid = name.replace(/\.jsonl\.lock$/, "")
+				const fp = path.join(sessionsDir, name)
+				let st: fs.Stats
+				try { st = fs.statSync(fp) } catch { continue }
+
+				const idleMs = Date.now() - st.mtimeMs
+				if (idleMs < AUTO_ABORT_THRESHOLD_MS) continue
+
+				let sessionKey: string
+				if (mainKey && sessionUuid === mainUuid) {
+					sessionKey = "agent:" + agentId + ":main"
+				} else {
+					sessionKey = "agent:" + agentId + ":session:" + sessionUuid
+				}
+
+				zombies.push({ sessionKey, idleMs })
+			}
+		}
+
+		// When auto-abort is disabled (default), just log candidates
+		if (!AUTO_ABORT_ENABLED) {
+			if (zombies.length > 0) {
+				console.info("[taas-affinity] zombie candidates (auto-abort disabled): " + zombies.length + " runs: " + zombies.map(z => z.sessionKey).join(", "))
+			}
+			return
+		}
+
+		// Auto-abort is enabled — abort each zombie not already aborted in this process
+		for (const z of zombies) {
+			if (abortedInThisProcess.includes(z.sessionKey)) continue
+			// Cap the set at AUTO_ABORT_ABORTED_SET_MAX (FIFO eviction)
+			if (abortedInThisProcess.length >= AUTO_ABORT_ABORTED_SET_MAX) {
+				abortedInThisProcess.shift()
+			}
+			abortedInThisProcess.push(z.sessionKey)
+
+			if (AUTO_ABORT_DRY_RUN) {
+				console.info("[taas-affinity] auto-abort DRY RUN: would abort sessionKey=" + z.sessionKey + " idleMs=" + z.idleMs)
+			} else {
+				console.warn("[taas-affinity] auto-aborting zombie run sessionKey=" + z.sessionKey + " idleMs=" + z.idleMs)
+				abortRun(z.sessionKey).catch((e: unknown) => {
+					console.warn("[taas-affinity] auto-abort failed sessionKey=" + z.sessionKey, e)
+				})
+			}
+		}
+	} catch (e) {
+		console.warn("[taas-affinity] abort-check error", e)
+	} finally {
+		abortCheckInProgress = false
+	}
+}
+
 // ── Background task scheduler ────────────────────────────────────────────────
 const backgroundTimers: (NodeJS.Timeout)[] = []
 
@@ -912,6 +1029,13 @@ function startBackgroundTasks(): void {
 		backgroundTimers.push(setInterval(() => writeRunStatus(), STATUS_INTERVAL_MS))
 	}, 5_000)
 	backgroundTimers.push(statusInit)
+
+	// Zombie auto-abort — 10s initial delay, then every AUTO_ABORT_CHECK_INTERVAL_MS
+	const abortInit = setTimeout(() => {
+		runAbortCheck()
+		backgroundTimers.push(setInterval(() => runAbortCheck(), AUTO_ABORT_CHECK_INTERVAL_MS))
+	}, 10_000)
+	backgroundTimers.push(abortInit)
 }
 
 const LAST_ROUTE_LIMIT = 256
@@ -1161,7 +1285,12 @@ export default {
 	_testExports: {
 		runTrashSweep,
 		writeRunStatus,
+		runAbortCheck,
+		setAbortRunFn,
 		resetSweepInProgress: () => { sweepInProgress = false },
 		resetStatusInProgress: () => { statusInProgress = false },
+		resetAbortCheckInProgress: () => { abortCheckInProgress = false },
+		clearAbortedInThisProcess: () => { abortedInThisProcess.length = 0 },
+		getAbortedInThisProcess: () => [...abortedInThisProcess],
 	},
 }
