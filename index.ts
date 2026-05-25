@@ -1158,4 +1158,10 @@ export default {
 		// Timers run for the lifetime of the gateway process.
 		try { startBackgroundTasks() } catch (e) { console.warn("[taas-affinity] failed to start background tasks", e) }
 	},
+	_testExports: {
+		runTrashSweep,
+		writeRunStatus,
+		resetSweepInProgress: () => { sweepInProgress = false },
+		resetStatusInProgress: () => { statusInProgress = false },
+	},
 }
