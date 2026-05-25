@@ -638,6 +638,7 @@ type AutorouterCapture = {
 
 const LAST_ROUTE_LIMIT = 256
 const lastRouteBySessionId = new Map<string, AutorouterCapture>()
+const lastRouteByAgentId = new Map<string, AutorouterCapture>()
 
 function pruneLastRouteMap(): void {
 	if (lastRouteBySessionId.size <= LAST_ROUTE_LIMIT) return
@@ -649,11 +650,41 @@ function pruneLastRouteMap(): void {
 	for (let i = 0; i < toDrop; i++) {
 		lastRouteBySessionId.delete(entries[i][0])
 	}
+	if (lastRouteByAgentId.size <= LAST_ROUTE_LIMIT) return
+	const aEntries = [...lastRouteByAgentId.entries()].sort(
+		(a, b) => a[1].capturedAt - b[1].capturedAt
+	)
+	const aDrop = aEntries.length - LAST_ROUTE_LIMIT
+	for (let i = 0; i < aDrop; i++) {
+		lastRouteByAgentId.delete(aEntries[i][0])
+	}
+}
+
+/**
+ * Derive a stable agent identifier from the OpenClaw runtime context. Prefers
+ * explicit env vars set by the gateway for sub-agents (OPENCLAW_AGENT_ID /
+ * OPENCLAW_RUN_ID), then falls back to the trailing path segment of agentDir
+ * or workspaceDir (e.g. /home/u/.openclaw/workspace-new-agent-3 -> "new-agent-3",
+ * /home/u/.openclaw/workspace -> "main").
+ */
+function deriveAgentIdForCapture(
+	ctx: { agentDir?: string; workspaceDir?: string }
+): string | null {
+	const envAgent = process.env.OPENCLAW_AGENT_ID ?? process.env.OPENCLAW_RUN_ID
+	if (envAgent && envAgent.trim()) return envAgent.trim()
+	const base = ctx.agentDir ?? ctx.workspaceDir
+	if (!base) return null
+	const seg = path.basename(path.resolve(base))
+	if (!seg) return null
+	if (seg === "workspace") return "main"
+	if (seg.startsWith("workspace-")) return seg.slice("workspace-".length)
+	return seg
 }
 
 function captureAutorouterFromHeaders(
 	sessionId: string,
-	headers: Record<string, string>
+	headers: Record<string, string>,
+	agentId: string | null
 ): void {
 	// Header names from TaaS proxy are emitted in canonical "X-TaaS-*" form
 	// but Node/undici lowercases incoming response headers. Read case-insensitively.
@@ -678,6 +709,7 @@ function captureAutorouterFromHeaders(
 		})(),
 	}
 	lastRouteBySessionId.set(sessionId, capture)
+	if (agentId) lastRouteByAgentId.set(agentId, capture)
 	pruneLastRouteMap()
 	if (isDev) {
 		console.debug(
@@ -693,11 +725,16 @@ function getLastRouteForSession(sessionId: string): AutorouterCapture | null {
 	return lastRouteBySessionId.get(sessionId) ?? null
 }
 
+function getLastRouteForAgent(agentId: string): AutorouterCapture | null {
+	return lastRouteByAgentId.get(agentId) ?? null
+}
+
 function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 	const { streamFn } = ctx
 	if (!streamFn) return undefined
 
 	const { sessionId, source } = resolveSessionId(ctx.workspaceDir)
+	const agentIdForCapture = deriveAgentIdForCapture(ctx)
 	const requesterRuntime = buildRequesterRuntime(ctx, sessionId, source)
 
 	if (isDev) {
@@ -727,7 +764,11 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 			responseModel
 		) => {
 			try {
-				captureAutorouterFromHeaders(sessionId, response?.headers ?? {})
+				captureAutorouterFromHeaders(
+					sessionId,
+					response?.headers ?? {},
+					agentIdForCapture
+				)
 			} catch (err) {
 				if (isDev) {
 					console.debug(
@@ -806,11 +847,27 @@ export default {
 			async ({ params, respond }) => {
 				// Accept either { workspaceDir } (preferred — derives sessionId the
 				// same way the wrapper does) or { sessionId } (direct lookup).
-				const p = (params ?? {}) as Record<string, unknown>
+				const pp = (params ?? {}) as Record<string, unknown>
+				const directAgentId =
+					typeof pp.agentId === "string" && pp.agentId.trim()
+						? pp.agentId.trim()
+						: null
 				const directSessionId =
-					typeof p.sessionId === "string" ? p.sessionId : null
+					typeof pp.sessionId === "string" ? pp.sessionId : null
 				const workspaceDir =
-					typeof p.workspaceDir === "string" ? p.workspaceDir : undefined
+					typeof pp.workspaceDir === "string" ? pp.workspaceDir : undefined
+
+				// Prefer agent-keyed lookup when the caller supplied an agentId.
+				if (directAgentId) {
+					const captured = getLastRouteForAgent(directAgentId)
+					respond(true, {
+						agentId: directAgentId,
+						sessionId: captured?.sessionId ?? null,
+						capture: captured,
+					})
+					return
+				}
+
 				const resolvedSessionId =
 					directSessionId ?? resolveSessionId(workspaceDir).sessionId
 				const captured = getLastRouteForSession(resolvedSessionId)
