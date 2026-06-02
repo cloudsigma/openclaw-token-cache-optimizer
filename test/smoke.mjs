@@ -13,7 +13,7 @@ plugin.register({
 
 assert.ok(provider, "provider should be registered")
 assert.equal(provider.id, "taas-affinity-hook")
-assert.deepEqual(provider.hookAliases, ["cloudsigma", "cloudsigma-staging"])
+assert.deepEqual(provider.hookAliases, ["cloudsigma", "cloudsigma-staging", "openai-completions"])
 assert.equal(typeof provider.wrapStreamFn, "function")
 assert.equal(typeof provider.resolveTransportTurnState, "function")
 
@@ -224,3 +224,7 @@ console.log("autorouter capture smoke ok")
 }
 
 console.log("per-agent keying smoke ok")
+
+// The plugin starts background maintenance timers during registration; the smoke
+// test has completed all assertions by this point, so exit explicitly.
+process.exit(0)

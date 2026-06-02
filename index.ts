@@ -1062,28 +1062,33 @@ function runAbortCheck(agentsDir?: string): void {
 // ── Background task scheduler ────────────────────────────────────────────────
 const backgroundTimers: (NodeJS.Timeout)[] = []
 
+function trackBackgroundTimer(timer: NodeJS.Timeout): void {
+	timer.unref?.()
+	backgroundTimers.push(timer)
+}
+
 function startBackgroundTasks(): void {
 	// Trash sweeper — randomised initial delay (0-30s) to stagger
 	const sweepDelay = Math.floor(Math.random() * 30_000)
 	const sweepInit = setTimeout(() => {
 		runTrashSweep()
-		backgroundTimers.push(setInterval(() => runTrashSweep(), SWEEP_INTERVAL_MS))
+		trackBackgroundTimer(setInterval(() => runTrashSweep(), SWEEP_INTERVAL_MS))
 	}, sweepDelay)
-	backgroundTimers.push(sweepInit)
+	trackBackgroundTimer(sweepInit)
 
 	// Stuck-run status writer — 5s initial delay, then every 30s
 	const statusInit = setTimeout(() => {
 		writeRunStatus()
-		backgroundTimers.push(setInterval(() => writeRunStatus(), STATUS_INTERVAL_MS))
+		trackBackgroundTimer(setInterval(() => writeRunStatus(), STATUS_INTERVAL_MS))
 	}, 5_000)
-	backgroundTimers.push(statusInit)
+	trackBackgroundTimer(statusInit)
 
 	// Zombie auto-abort — 10s initial delay, then every AUTO_ABORT_CHECK_INTERVAL_MS
 	const abortInit = setTimeout(() => {
 		runAbortCheck()
-		backgroundTimers.push(setInterval(() => runAbortCheck(), AUTO_ABORT_CHECK_INTERVAL_MS))
+		trackBackgroundTimer(setInterval(() => runAbortCheck(), AUTO_ABORT_CHECK_INTERVAL_MS))
 	}, 10_000)
-	backgroundTimers.push(abortInit)
+	trackBackgroundTimer(abortInit)
 }
 
 const LAST_ROUTE_LIMIT = 256

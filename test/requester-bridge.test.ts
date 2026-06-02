@@ -335,7 +335,7 @@ test("plugin executes non-scaffold requester tools through requester-local gatew
 	try {
 		await runPayload(captureWrapper(plugin), { messages: [] }, { baseUrl: `http://127.0.0.1:${taasAddress.port}` })
 		await new Promise((resolve) => setTimeout(resolve, 150))
-		assert.deepEqual(gatewayBody, { tool: "prd_list", args: { query: "requester bridge" } })
+		assert.deepEqual(gatewayBody, { name: "prd_list", arguments: { query: "requester bridge" }, tool: "prd_list", args: { query: "requester bridge" } })
 		assert.equal(resultBody.operation_id, "bro_tool")
 		assert.equal(resultBody.ok, true)
 		assert.deepEqual(resultBody.result, { rows: [{ title: "PRD" }] })
