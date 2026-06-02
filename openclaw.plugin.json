@@ -1,10 +1,15 @@
 {
-	"id": "openclaw-taas-affinity",
-	"providers": ["cloudsigma", "cloudsigma-staging"],
-	"configSchema": {
-		"type": "object",
-		"additionalProperties": false,
-		"properties": {},
-		"required": []
-	}
+  "id": "openclaw-taas-affinity",
+  "providers": [
+    "cloudsigma",
+    "cloudsigma-staging"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {},
+    "required": []
+  },
+  "name": "CloudSigma TaaS Affinity",
+  "description": "Provider plugin: injects X-Session-Id header for TaaS prompt-cache affinity"
 }
