@@ -58,8 +58,13 @@ assert.equal(
 )
 assert.equal(
 	capturedPayload.metadata.requester_runtime.redaction_policy,
-	"no_secrets;bounded_paths;no_env_values;no_git_remotes;no_status_or_diffs;no_extra_params"
+	"no_secrets;no_raw_local_paths;no_env_values;no_git_remotes;no_status_or_diffs;no_extra_params"
 )
+assert.equal(
+	capturedPayload.metadata.requester_runtime.tool_execution,
+	"direction_2_gateway"
+)
+assert.equal("available_bridges" in capturedPayload.metadata.requester_runtime, false)
 
 const transportState = provider.resolveTransportTurnState({
 	provider: "cloudsigma",

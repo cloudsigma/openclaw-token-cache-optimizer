@@ -17,31 +17,15 @@ import type {
  * outbound request to CloudSigma TaaS providers so the session-affinity layer
  * achieves confidence=1.0 from turn 1, maximising prompt-cache hit rates.
  *
- * For CloudSigma TaaS providers, the plugin also creates/refreshes a short
- * requester bridge lease and injects the returned opaque descriptor into
- * metadata.requester_runtime.available_bridges. Set
- * TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED=0 to disable this behaviour explicitly.
- * The bridge remains requester-authorized: TaaS is the relay/audit/transport
- * layer, while requester/plugin-side permissions decide actual tool execution.
+ * Requester-side tool execution is handled by OpenClaw / Claude Code / TaaS
+ * Direction-2. This plugin only provides affinity metadata, the X-Session-Id
+ * transport header, and TaaS autorouter response-header capture.
  */
 
 const SESSION_ID_PREFIX = "oc:"
-const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-05-23"
+const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-06-03"
 const REQUESTER_RUNTIME_SOURCE = "openclaw-token-cache-optimizer"
-const REQUESTER_BRIDGE_PLUGIN_FLAG = "TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED"
-const DEFAULT_TAAS_BASE_URL = "https://taas.cloudsigma.com"
-const REQUESTER_BRIDGE_LEASE_PATH = "/internal/requester-bridges/leases"
-const REQUESTER_BRIDGE_POLL_PATH = "/internal/requester-bridges/poll"
-const REQUESTER_BRIDGE_RESULTS_PATH = "/internal/requester-bridges/results"
-const REQUESTER_BRIDGE_CAPABILITY = "requester.tool.invoke"
-const REQUESTER_BRIDGE_CAPABILITY_LEGACY = "openclaw.tool.invoke"
-const REQUESTER_BRIDGE_DEFAULT_TTL_SECONDS = 5 * 60
 const GIT_PROBE_TIMEOUT_MS = 250
-const LEASE_REQUEST_TIMEOUT_MS = 1200
-const POLL_REQUEST_TIMEOUT_MS = 1200
-const DEFAULT_POLL_INTERVAL_MS = 1000
-const DEFAULT_GATEWAY_URL = "http://127.0.0.1:18789"
-const MAX_ECHO_BYTES = 4096
 
 type RequesterRuntime = Record<string, unknown>
 
@@ -53,45 +37,12 @@ type RuntimeContextHints = {
 	provider?: string
 }
 
-type LeaseResponse = {
-	ok?: boolean
-	descriptor?: unknown
-	lease_id?: unknown
-	bridge_id?: unknown
-}
-
-type BridgePollOperation = {
-	operation_id?: unknown
-	audit_id?: unknown
-	lease_id?: unknown
-	bridge_id?: unknown
-	operation?: unknown
-	arguments?: unknown
-	claim_id?: unknown
-	claim_expires_at?: unknown
-	delivery_attempt?: unknown
-}
-
-type PollerState = { timer?: NodeJS.Timeout; inFlight: boolean; stopped?: boolean; leaseId?: string }
-
 // OpenClaw stores the active registry state (including workspaceDir) on globalThis
 // under this well-known symbol key.
 const PLUGIN_REGISTRY_STATE = Symbol.for("openclaw.pluginRegistryState")
 
 const isDev =
 	process.env.NODE_ENV === "development" || Boolean(process.env.OPENCLAW_DEBUG)
-
-const activePollers = new Map<string, PollerState>()
-
-function envFlagDisabled(name: string): boolean {
-	return ["0", "false", "no", "off"].includes(
-		(process.env[name] ?? "").trim().toLowerCase()
-	)
-}
-
-function requesterBridgePluginEnabled(): boolean {
-	return !envFlagDisabled(REQUESTER_BRIDGE_PLUGIN_FLAG)
-}
 
 /**
  * Resolves the best available session source string, working through the
@@ -268,156 +219,70 @@ function buildRequesterRuntime(
 	return {
 		schema_version: REQUESTER_RUNTIME_SCHEMA_VERSION,
 		source: REQUESTER_RUNTIME_SOURCE,
-		capture_mode: "advisory_only",
 		session_key: sessionId,
 		openclaw_session_id: sessionId,
-		...(hints.workspaceDir && { workspace_dir: path.resolve(hints.workspaceDir) }),
-		...(hints.agentDir && { agent_dir: path.resolve(hints.agentDir) }),
-		...(hints.repoRoot && { repo_root_hint: hints.repoRoot, repo_name: path.basename(hints.repoRoot) }),
+		requester_host_id: stableHash(os.hostname(), "host"),
+		...(hints.repoRoot && { repo_name: path.basename(hints.repoRoot) }),
 		...(hints.repoRoot && { git_branch_hint: readGitHeadBranch(hints.repoRoot) }),
 		...(hints.repoRoot && { git_dirty_hint: readGitDirtyHint(hints.repoRoot) }),
-		requester_host_id: stableHash(os.hostname(), "host"),
 		...(hints.provider && { provider: hints.provider }),
 		...(hints.modelId && { model_id: hints.modelId }),
 		session_source_hint: stableHash(source, "source"),
-		available_bridges: [],
-		required_execution_mode: "advisory_only",
-		redaction_policy: "no_secrets;bounded_paths;no_env_values;no_git_remotes;no_status_or_diffs;no_extra_params",
+		tool_execution: "direction_2_gateway",
+		metadata_classification: {
+			identifiers: "hashed",
+			repository: "name_branch_dirty_only",
+			local_paths: "omitted_by_default",
+		},
+		redaction_policy: "no_secrets;no_raw_local_paths;no_env_values;no_git_remotes;no_status_or_diffs;no_extra_params",
 	}
 }
 
-function isTaasProvider(ctx: ProviderWrapStreamFnContext): boolean {
-	const provider = safeString((ctx as unknown as Record<string, unknown>).provider)
-	return provider === "cloudsigma" || provider === "cloudsigma-staging"
-}
-
-function providerBaseUrl(payload: Record<string, unknown>, ctx: ProviderWrapStreamFnContext): string | undefined {
-	const direct = safeString(payload.base_url) ?? safeString(payload.baseURL)
-	if (direct) return direct
-	const modelRecord = asRecord((ctx as unknown as Record<string, unknown>).model)
-	return safeString(modelRecord?.baseUrl) ?? safeString(modelRecord?.baseURL)
-}
-
-function requesterBridgeLeaseUrl(payload: Record<string, unknown>, ctx: ProviderWrapStreamFnContext): string | undefined {
-	const explicit = safeString(process.env.TAAS_REQUESTER_BRIDGE_LEASE_URL)
-	if (explicit) return explicit
-	const base = providerBaseUrl(payload, ctx) ?? DEFAULT_TAAS_BASE_URL
-	try {
-		return new URL(REQUESTER_BRIDGE_LEASE_PATH, base.endsWith("/") ? base : `${base}/`).toString()
-	} catch {
-		return undefined
+function patchPayloadMetadata(
+	payload: Record<string, unknown>,
+	sessionId: string,
+	requesterRuntime?: RequesterRuntime
+): Record<string, unknown> {
+	const existingMeta = asRecord(payload.metadata) ?? {}
+	// Never overwrite existing metadata fields — the caller owns them.
+	const needsSessionId = !existingMeta.session_id
+	const needsStickyKey = !existingMeta.sticky_key
+	const needsRequesterRuntime = requesterRuntime && !existingMeta.requester_runtime
+	if (!needsSessionId && !needsStickyKey && !needsRequesterRuntime) return payload
+	return {
+		...payload,
+		metadata: {
+			...existingMeta,
+			...(needsSessionId && { session_id: sessionId }),
+			...(needsStickyKey && { sticky_key: sessionId }),
+			...(needsRequesterRuntime && { requester_runtime: requesterRuntime }),
+		},
 	}
 }
 
-function bridgeSiblingUrl(leaseUrl: string, pathName: string): string | undefined {
-	try {
-		const url = new URL(leaseUrl)
-		url.pathname = pathName
-		url.search = ""
-		return url.toString()
-	} catch {
-		return undefined
-	}
+/**
+ * Captured autorouter metadata per-session, populated by the onResponse callback
+ * installed in `buildWrapper`. Exposed via the `taas.autorouter.lastRoute` gateway
+ * RPC so Alien AI Studio (or any other client) can pull the latest TaaS routing
+ * decision for a session — including the actual model chosen by the autorouter,
+ * the algorithm used, the source of that algorithm (org/dept/key/user/system),
+ * the thinking level applied, and the chosen model's context window.
+ *
+ * The map is keyed by the affinity session ID we already derive in
+ * `resolveSessionId(ctx.workspaceDir)`. Stored values are bounded — see
+ * `LAST_ROUTE_LIMIT` — to avoid unbounded growth in long-lived gateways.
+ */
+type AutorouterCapture = {
+	sessionId: string
+	capturedAt: number
+	autorouterModel: string | null
+	autorouterAlgo: string | null
+	autorouterAlgoSource: string | null
+	thinkingApplied: string | null
+	routedContextWindow: number | null
 }
 
-function pollIntervalMs(): number {
-	const value = Number.parseInt(process.env.TAAS_REQUESTER_BRIDGE_POLL_INTERVAL_MS ?? "", 10)
-	if (Number.isFinite(value) && value >= 50) return Math.min(value, 30_000)
-	return DEFAULT_POLL_INTERVAL_MS
-}
 
-function boundedJson(value: unknown): unknown {
-	const encoded = JSON.stringify(value ?? null)
-	if (encoded.length <= MAX_ECHO_BYTES) return value
-	return { truncated: true, message: "echo payload exceeded bridge scaffold size limit" }
-}
-
-function requesterGatewayUrl(): string {
-	return safeString(process.env.TAAS_REQUESTER_LOCAL_GATEWAY_URL)
-		?? safeString(process.env.OPENCLAW_GATEWAY_URL)
-		?? (safeString(process.env.OPENCLAW_GATEWAY_PORT) ? `http://127.0.0.1:${process.env.OPENCLAW_GATEWAY_PORT}` : DEFAULT_GATEWAY_URL)
-}
-
-function requesterGatewayToken(): string | undefined {
-	return safeString(process.env.TAAS_REQUESTER_LOCAL_GATEWAY_TOKEN)
-		?? safeString(process.env.OPENCLAW_GATEWAY_TOKEN)
-		?? safeString(process.env.OPENCLAW_GATEWAY_PASSWORD)
-}
-
-async function invokeRequesterLocalTool(tool: string, args: Record<string, unknown>): Promise<{ ok: true; result: unknown } | { ok: false; error: { code: string; message: string } }> {
-	const controller = new AbortController()
-	const timer = setTimeout(() => controller.abort(), POLL_REQUEST_TIMEOUT_MS)
-	try {
-		const headers: Record<string, string> = { "Content-Type": "application/json" }
-		const token = requesterGatewayToken()
-		if (token) headers.Authorization = `Bearer ${token}`
-		const response = await fetch(`${requesterGatewayUrl().replace(/\/+$/, "")}/tools/invoke`, {
-			method: "POST",
-			headers,
-			body: JSON.stringify({ tool, args }),
-			signal: controller.signal,
-		})
-		const json = await response.json().catch(() => undefined) as { ok?: boolean; result?: unknown; error?: { type?: string; code?: string; message?: string } } | undefined
-		if (!response.ok || !json || json.ok !== true) {
-			const code = json?.error?.code ?? json?.error?.type ?? `http_${response.status}`
-			const message = json?.error?.message ?? `Requester local tool invoke failed: ${code}`
-			return { ok: false, error: { code, message } }
-		}
-		return { ok: true, result: json.result }
-	} catch (err) {
-		const name = err instanceof Error && err.name ? err.name : "requester_tool_invoke_failed"
-		const message = err instanceof Error && err.message ? err.message : String(err)
-		return { ok: false, error: { code: name, message } }
-	} finally {
-		clearTimeout(timer)
-	}
-}
-
-async function executeSafeBridgeOperation(operation: BridgePollOperation): Promise<{ ok: true; result: unknown } | { ok: false; error: { code: string; message: string } }> {
-	if (operation.operation !== REQUESTER_BRIDGE_CAPABILITY && operation.operation !== REQUESTER_BRIDGE_CAPABILITY_LEGACY) {
-		return { ok: false, error: { code: "unsupported_operation", message: "Unsupported requester bridge operation" } }
-	}
-	const args = asRecord(operation.arguments) ?? {}
-	const tool = safeString(args.tool) ?? safeString(args.tool_name) ?? safeString(args.name)
-	const toolArgs = asRecord(args.arguments) ?? asRecord(args.input) ?? {}
-	if (!tool) return { ok: false, error: { code: "missing_tool", message: "Requester bridge operation missing tool name" } }
-	if (tool === "bridge.ping") {
-		return { ok: true, result: { pong: true, echo: boundedJson(toolArgs), scaffold: true } }
-	}
-	if (tool === "bridge.echo") {
-		return { ok: true, result: { echo: boundedJson(toolArgs), scaffold: true } }
-	}
-	return invokeRequesterLocalTool(tool, toolArgs)
-}
-
-async function postBridgeResult(resultsUrl: string, descriptor: Record<string, unknown>, operation: BridgePollOperation, outcome: Awaited<ReturnType<typeof executeSafeBridgeOperation>>): Promise<void> {
-	const controller = new AbortController()
-	const timer = setTimeout(() => controller.abort(), POLL_REQUEST_TIMEOUT_MS)
-	try {
-		const claimId = typeof operation.claim_id === "string" ? operation.claim_id : undefined
-		await fetch(resultsUrl, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({
-				schema_version: REQUESTER_RUNTIME_SCHEMA_VERSION,
-				lease_id: descriptor.lease_id,
-				bridge_id: descriptor.bridge_id,
-				auth_context_id: descriptor.auth_context_id,
-				operation_id: operation.operation_id,
-				audit_id: operation.audit_id,
-				...(claimId && { claim_id: claimId }),
-				...outcome,
-			}),
-			signal: controller.signal,
-		})
-	} catch (err) {
-		if (isDev) console.debug(`[taas-affinity] requester bridge result post failed: ${err instanceof Error ? err.name : "unknown"}`)
-	} finally {
-		clearTimeout(timer)
-	}
-}
-
-const DEFAULT_POLL_WAIT_MS = 25_000
 // ── Trash sweeper configuration ──────────────────────────────────────────────
 const SWEEP_INTERVAL_MS = Number(process.env.TAAS_AFFINITY_SWEEP_INTERVAL_MS) || 3_600_000
 const SWEEP_STALE_DAYS = Number(process.env.TAAS_AFFINITY_SWEEP_STALE_DAYS) || 7
@@ -462,224 +327,6 @@ let abortRun: (sessionKey: string) => Promise<void> = async (sessionKey: string)
 function setAbortRunFn(fn: (sessionKey: string) => Promise<void>): void {
 	abortRun = fn
 }
-
-function stopRequesterBridgePoller(leaseId?: string): void {
-	if (!leaseId) return
-	const state = activePollers.get(leaseId)
-	if (!state) return
-	state.stopped = true
-	if (state.timer) clearInterval(state.timer)
-	activePollers.delete(leaseId)
-}
-
-async function pollRequesterBridgeOnce(pollUrl: string, resultsUrl: string, descriptor: Record<string, unknown>, state: PollerState): Promise<void> {
-	if (state.inFlight || state.stopped) return
-	state.inFlight = true
-	const controller = new AbortController()
-	const timer = setTimeout(() => controller.abort(), Math.max(POLL_REQUEST_TIMEOUT_MS, DEFAULT_POLL_WAIT_MS + 5_000))
-	try {
-		const response = await fetch(pollUrl, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({
-				schema_version: REQUESTER_RUNTIME_SCHEMA_VERSION,
-				lease_id: descriptor.lease_id,
-				bridge_id: descriptor.bridge_id,
-				auth_context_id: descriptor.auth_context_id,
-				max_operations: 10,
-				wait_ms: DEFAULT_POLL_WAIT_MS,
-			}),
-			signal: controller.signal,
-		})
-		if (!response.ok) {
-			const json = await response.json().catch(() => undefined) as { error?: { code?: unknown } } | undefined
-			const code = safeString(json?.error?.code)
-			if (response.status === 404 || code === "lease_expired_or_unknown") {
-				// Lease state is server/cache-owned and can disappear on rollout or TTL expiry.
-				// Stop polling this dead lease immediately; the next provider turn will create
-				// a fresh lease instead of hammering TaaS/Redis with stale IDs.
-				stopRequesterBridgePoller(state.leaseId ?? safeString(descriptor.lease_id))
-			}
-			return
-		}
-		const json = await response.json() as { operations?: unknown }
-		const operations = Array.isArray(json.operations) ? json.operations : []
-		for (const raw of operations) {
-			const operation = asRecord(raw) as BridgePollOperation | undefined
-			if (!operation || !operation.operation_id) continue
-			const outcome = await executeSafeBridgeOperation(operation)
-			await postBridgeResult(resultsUrl, descriptor, operation, outcome)
-		}
-	} catch (err) {
-		if (isDev) console.debug(`[taas-affinity] requester bridge poll failed: ${err instanceof Error ? err.name : "unknown"}`)
-	} finally {
-		clearTimeout(timer)
-		state.inFlight = false
-	}
-}
-
-function startRequesterBridgePoller(leaseUrl: string, descriptor: Record<string, unknown>): void {
-	const leaseId = safeString(descriptor.lease_id)
-	if (!leaseId || activePollers.has(leaseId)) return
-	const pollUrl = bridgeSiblingUrl(leaseUrl, REQUESTER_BRIDGE_POLL_PATH)
-	const resultsUrl = bridgeSiblingUrl(leaseUrl, REQUESTER_BRIDGE_RESULTS_PATH)
-	if (!pollUrl || !resultsUrl) return
-	const state: PollerState = { inFlight: false, leaseId }
-	activePollers.set(leaseId, state)
-	const tick = () => { void pollRequesterBridgeOnce(pollUrl, resultsUrl, descriptor, state) }
-	state.timer = setInterval(tick, pollIntervalMs())
-	state.timer.unref?.()
-	tick()
-}
-
-function isSafeDescriptor(value: unknown): value is Record<string, unknown> {
-	const descriptor = asRecord(value)
-	if (!descriptor) return false
-	if ("bridge_required" in descriptor) return false
-	const capabilities = descriptor.capabilities
-	if (!Array.isArray(capabilities) || (capabilities.includes(REQUESTER_BRIDGE_CAPABILITY) === false && capabilities.includes(REQUESTER_BRIDGE_CAPABILITY_LEGACY) === false)) {
-		return false
-	}
-	const encoded = JSON.stringify(descriptor)
-	const lowered = encoded.toLowerCase()
-	return ![
-		"endpoint_url",
-		"access_token",
-		"refresh_token",
-		"authorization",
-		"bearer ",
-		"api_key",
-		"apikey",
-		"password",
-		"secret",
-	].some((needle) => lowered.includes(needle))
-}
-
-async function createRequesterBridgeLease(
-	url: string,
-	runtime: RequesterRuntime,
-	ctx: ProviderWrapStreamFnContext
-): Promise<Record<string, unknown> | undefined> {
-	const workspaceDir = safeString(runtime.workspace_dir)
-	const repoRoot = safeString(runtime.repo_root_hint)
-	const repoName = safeString(runtime.repo_name)
-	const controller = new AbortController()
-	const timer = setTimeout(() => controller.abort(), LEASE_REQUEST_TIMEOUT_MS)
-	try {
-		const body = {
-			schema_version: REQUESTER_RUNTIME_SCHEMA_VERSION,
-			session_key: runtime.session_key,
-			openclaw_session_id: runtime.openclaw_session_id,
-			requester_host_id: runtime.requester_host_id,
-			workspace: {
-				...(workspaceDir && { workspace_dir: workspaceDir }),
-				...(repoRoot && { repo_root: repoRoot }),
-				...(repoName && { repo_name: repoName }),
-			},
-			capabilities: [REQUESTER_BRIDGE_CAPABILITY],
-			ttl_s: REQUESTER_BRIDGE_DEFAULT_TTL_SECONDS,
-			callback: { mode: "poll" },
-			client: {
-				source: REQUESTER_RUNTIME_SOURCE,
-				provider: runtime.provider,
-				model_id: runtime.model_id,
-			},
-		}
-		const response = await fetch(url, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				"X-Session-Id": String(runtime.session_key),
-			},
-			body: JSON.stringify(body),
-			signal: controller.signal,
-		})
-		if (!response.ok) {
-			if (isDev) console.debug(`[taas-affinity] requester bridge lease failed status=${response.status}`)
-			return undefined
-		}
-		const json = (await response.json()) as LeaseResponse
-		if (!json.ok || !isSafeDescriptor(json.descriptor)) return undefined
-		const descriptor = json.descriptor
-		startRequesterBridgePoller(url, descriptor)
-		return descriptor
-	} catch (err) {
-		if (isDev) console.debug(`[taas-affinity] requester bridge lease unavailable: ${err instanceof Error ? err.name : "unknown"}`)
-		return undefined
-	} finally {
-		clearTimeout(timer)
-	}
-}
-
-async function maybeUpgradeRequesterRuntimeWithBridge(
-	runtime: RequesterRuntime,
-	payload: Record<string, unknown>,
-	ctx: ProviderWrapStreamFnContext
-): Promise<RequesterRuntime> {
-	if (!requesterBridgePluginEnabled() || !isTaasProvider(ctx)) return runtime
-	const url = requesterBridgeLeaseUrl(payload, ctx)
-	if (!url) {
-		if (isDev) console.debug("[taas-affinity] requester bridge enabled but no TaaS base URL found")
-		return runtime
-	}
-	const descriptor = await createRequesterBridgeLease(url, runtime, ctx)
-	if (!descriptor) return runtime
-	return {
-		...runtime,
-		capture_mode: "bridge_capable",
-		available_bridges: [descriptor],
-		required_execution_mode: "advisory_only",
-	}
-}
-
-async function patchPayloadMetadata(
-	payload: Record<string, unknown>,
-	sessionId: string,
-	requesterRuntime?: RequesterRuntime,
-	ctx?: ProviderWrapStreamFnContext
-): Promise<Record<string, unknown>> {
-	const existingMeta = asRecord(payload.metadata) ?? {}
-	// Never overwrite existing metadata fields — the caller owns them.
-	const needsSessionId = !existingMeta.session_id
-	const needsStickyKey = !existingMeta.sticky_key
-	const needsRequesterRuntime = requesterRuntime && !existingMeta.requester_runtime
-	if (!needsSessionId && !needsStickyKey && !needsRequesterRuntime) return payload
-	const runtime = needsRequesterRuntime && requesterRuntime && ctx
-		? await maybeUpgradeRequesterRuntimeWithBridge(requesterRuntime, payload, ctx)
-		: requesterRuntime
-	return {
-		...payload,
-		metadata: {
-			...existingMeta,
-			...(needsSessionId && { session_id: sessionId }),
-			...(needsStickyKey && { sticky_key: sessionId }),
-			...(needsRequesterRuntime && { requester_runtime: runtime }),
-		},
-	}
-}
-
-/**
- * Captured autorouter metadata per-session, populated by the onResponse callback
- * installed in `buildWrapper`. Exposed via the `taas.autorouter.lastRoute` gateway
- * RPC so Alien AI Studio (or any other client) can pull the latest TaaS routing
- * decision for a session — including the actual model chosen by the autorouter,
- * the algorithm used, the source of that algorithm (org/dept/key/user/system),
- * the thinking level applied, and the chosen model's context window.
- *
- * The map is keyed by the affinity session ID we already derive in
- * `resolveSessionId(ctx.workspaceDir)`. Stored values are bounded — see
- * `LAST_ROUTE_LIMIT` — to avoid unbounded growth in long-lived gateways.
- */
-type AutorouterCapture = {
-	sessionId: string
-	capturedAt: number
-	autorouterModel: string | null
-	autorouterAlgo: string | null
-	autorouterAlgoSource: string | null
-	thinkingApplied: string | null
-	routedContextWindow: number | null
-}
-
 
 // ── Trash sweeper ────────────────────────────────────────────────────────────
 let sweepInProgress = false
@@ -1014,28 +661,31 @@ function runAbortCheck(agentsDir?: string): void {
 // ── Background task scheduler ────────────────────────────────────────────────
 const backgroundTimers: (NodeJS.Timeout)[] = []
 
+function trackBackgroundTimer(timer: NodeJS.Timeout): NodeJS.Timeout {
+	timer.unref?.()
+	backgroundTimers.push(timer)
+	return timer
+}
+
 function startBackgroundTasks(): void {
 	// Trash sweeper — randomised initial delay (0-30s) to stagger
 	const sweepDelay = Math.floor(Math.random() * 30_000)
-	const sweepInit = setTimeout(() => {
+	trackBackgroundTimer(setTimeout(() => {
 		runTrashSweep()
-		backgroundTimers.push(setInterval(() => runTrashSweep(), SWEEP_INTERVAL_MS))
-	}, sweepDelay)
-	backgroundTimers.push(sweepInit)
+		trackBackgroundTimer(setInterval(() => runTrashSweep(), SWEEP_INTERVAL_MS))
+	}, sweepDelay))
 
 	// Stuck-run status writer — 5s initial delay, then every 30s
-	const statusInit = setTimeout(() => {
+	trackBackgroundTimer(setTimeout(() => {
 		writeRunStatus()
-		backgroundTimers.push(setInterval(() => writeRunStatus(), STATUS_INTERVAL_MS))
-	}, 5_000)
-	backgroundTimers.push(statusInit)
+		trackBackgroundTimer(setInterval(() => writeRunStatus(), STATUS_INTERVAL_MS))
+	}, 5_000))
 
 	// Zombie auto-abort — 10s initial delay, then every AUTO_ABORT_CHECK_INTERVAL_MS
-	const abortInit = setTimeout(() => {
+	trackBackgroundTimer(setTimeout(() => {
 		runAbortCheck()
-		backgroundTimers.push(setInterval(() => runAbortCheck(), AUTO_ABORT_CHECK_INTERVAL_MS))
-	}, 10_000)
-	backgroundTimers.push(abortInit)
+		trackBackgroundTimer(setInterval(() => runAbortCheck(), AUTO_ABORT_CHECK_INTERVAL_MS))
+	}, 10_000))
 }
 
 const LAST_ROUTE_LIMIT = 256
@@ -1156,7 +806,7 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 				if (prevOnPayload) return prevOnPayload(payload, payloadModel)
 				return payload
 			}
-			const patched = await patchPayloadMetadata(payloadRecord, sessionId, requesterRuntime, ctx)
+			const patched = patchPayloadMetadata(payloadRecord, sessionId, requesterRuntime)
 			if (prevOnPayload) return prevOnPayload(patched, payloadModel)
 			return patched
 		}
