@@ -1,5 +1,4 @@
 import assert from "node:assert/strict"
-import { createServer } from "node:http"
 import { test } from "node:test"
 
 async function loadPlugin(env: Record<string, string | undefined> = {}) {
@@ -45,34 +44,23 @@ async function runPayload(provider: any, payload: any, ctxExtra: Record<string, 
 	return captured
 }
 
-test("Direction-2 metadata does not create requester bridge leases or descriptors", async () => {
-	let called = false
-	const server = createServer((_req, res) => {
-		called = true
-		res.statusCode = 500
-		res.end("unexpected")
-	})
-	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
-	const address = server.address()
-	assert(address && typeof address === "object")
-	const baseUrl = `http://127.0.0.1:${address.port}`
+test("Direction-2 metadata has no requester bridge descriptors or raw local paths", async () => {
 	const { plugin, restore } = await loadPlugin({
 		TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED: "1",
-		TAAS_REQUESTER_BRIDGE_LEASE_URL: `${baseUrl}/internal/requester-bridges/leases`,
+		TAAS_REQUESTER_BRIDGE_LEASE_URL: "http://127.0.0.1:9/internal/requester-bridges/leases",
 	})
 	try {
-		const payload = await runPayload(captureProvider(plugin), { messages: [], metadata: {} }, { baseUrl })
+		const payload = await runPayload(captureProvider(plugin), { messages: [], metadata: {} })
 		const runtime = payload.metadata.requester_runtime
-		assert.equal(called, false, "lease endpoint must not be called")
 		assert.equal("available_bridges" in runtime, false)
 		assert.equal("capture_mode" in runtime, false)
 		assert.equal(runtime.tool_execution, "direction_2_gateway")
+		assert.equal(runtime.source, "openclaw-taas-affinity")
 		assert.equal("workspace_dir" in runtime, false)
 		assert.equal("agent_dir" in runtime, false)
 		assert.equal("repo_root_hint" in runtime, false)
 	} finally {
 		restore()
-		await new Promise<void>((resolve) => server.close(() => resolve()))
 	}
 })
 

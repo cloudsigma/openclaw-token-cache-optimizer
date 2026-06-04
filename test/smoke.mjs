@@ -1,5 +1,10 @@
 import assert from "node:assert/strict"
+import fs from "node:fs"
 import plugin from "../index.ts"
+
+const manifest = JSON.parse(fs.readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"))
+assert.equal(manifest.activation.onStartup, true, "plugin explicitly loads at gateway startup")
+assert.deepEqual(manifest.activation.onProviders, ["cloudsigma", "cloudsigma-staging"])
 
 assert.equal(plugin.id, "openclaw-taas-affinity")
 assert.equal(typeof plugin.register, "function")
@@ -42,7 +47,7 @@ assert.match(capturedPayload.metadata.session_id, /^oc:[a-f0-9]{16}$/)
 assert.equal(capturedPayload.metadata.sticky_key, capturedPayload.metadata.session_id)
 assert.equal(
 	capturedPayload.metadata.requester_runtime.source,
-	"openclaw-token-cache-optimizer"
+	"openclaw-taas-affinity"
 )
 assert.equal(
 	capturedPayload.metadata.requester_runtime.session_key,
