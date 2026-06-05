@@ -13,7 +13,9 @@ For requests routed through the `cloudsigma` or `cloudsigma-staging` provider ID
 - injects `metadata.sticky_key` when absent
 - injects a sanitized `metadata.requester_runtime` envelope when absent
 - injects transport header `X-Session-Id`
-- captures TaaS autorouter response headers
+- injects correlation headers `X-OpenClaw-Session-Id`, `X-OpenClaw-Turn-Id`, `X-OpenClaw-Attempt`, and `X-OpenClaw-Agent-Id` (when available)
+- injects `metadata.openclaw_correlation` for request/run tracing
+- captures TaaS autorouter + request/trace response headers
 - exposes the latest route capture via gateway method `taas.autorouter.lastRoute`
 
 ## Startup compatibility
@@ -59,6 +61,17 @@ Example injected metadata:
         "local_paths": "omitted_by_default"
       },
       "redaction_policy": "no_secrets;no_raw_local_paths;no_env_values;no_git_remotes;no_status_or_diffs;no_extra_params"
+    },
+    "openclaw_correlation": {
+      "schema_version": "2026-06-05",
+      "source": "openclaw-taas-affinity",
+      "plugin_version": "0.5.2",
+      "session_id": "oc:0123456789abcdef",
+      "sticky_key": "oc:0123456789abcdef",
+      "session_source_hint": "source:1a2b3c4d5e6f7890",
+      "agent_id": "new-agent-2",
+      "provider": "cloudsigma",
+      "model_id": "cloudsigma/auto"
     }
   }
 }
