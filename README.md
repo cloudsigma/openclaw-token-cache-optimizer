@@ -1,251 +1,184 @@
-# openclaw-token-cache-optimizer
+# openclaw-taas-affinity
 
-An [OpenClaw](https://openclaw.ai) plugin that maximises prompt-cache hit rates when using [CloudSigma TaaS](https://www.cloudsigma.com) as your LLM provider.
+CloudSigma TaaS affinity provider hook for OpenClaw.
 
-It injects a stable, per-conversation session ID into every outbound request so TaaS can pin your conversation to the same upstream slot (OAuth token, Bedrock region, or Claude Code node) from the very first turn — giving you consistent prompt-cache reuse instead of cold starts on every message.
+This plugin is intentionally narrow after the Claude Code Direction-2 lane update. It does **not** lease requester bridges, poll for bridge work, invoke requester-local tools, rewrite OpenAI tool payloads, or run OpenClaw maintenance sidecars.
 
----
+## What it does
 
-## The problem it solves
+For requests routed through the `cloudsigma` or `cloudsigma-staging` provider IDs, the plugin:
 
-TaaS routes LLM requests across a pool of upstream slots. Without a session signal, it uses heuristics to guess which requests belong to the same conversation:
+- derives a stable affinity session ID with the form `oc:<sha256-prefix>`
+- injects `metadata.session_id` when absent
+- injects `metadata.sticky_key` when absent
+- injects a sanitized `metadata.requester_runtime` envelope when absent
+- injects transport header `X-Session-Id`
+- captures TaaS autorouter response headers
+- exposes the latest route capture via gateway method `taas.autorouter.lastRoute`
 
-| Method | Confidence | Works when |
-|---|---|---|
-| Tool-use ID chain | 1.0 | Tool-result follow-up turns only |
-| Structural inference | 0.85 | Mid-conversation, after a few turns |
-| New session fallback | 0.30 | First turn — no prior context |
+## Startup compatibility
 
-That **0.30 confidence on turn 1** means the first message in every conversation is likely routed to a random slot, breaking prompt-cache continuity right from the start.
+The manifest explicitly asks OpenClaw to import the plugin at gateway startup:
 
-This plugin passes a stable `session_id` derived from your OpenClaw workspace so TaaS short-circuits heuristic matching and achieves **confidence 1.0 from turn 1**.
+```json
+{
+  "activation": {
+    "onStartup": true,
+    "onProviders": ["cloudsigma", "cloudsigma-staging"]
+  }
+}
+```
 
----
+This is required because gateway RPC handlers must be attached during gateway startup. Provider/lazy activation is not enough for `taas.autorouter.lastRoute` to be present in the live gateway dispatch table.
 
-## How it works
+## Request metadata
 
-OpenClaw's `wrapStreamFn` hook intercepts the outbound request payload before it is sent to TaaS. The plugin adds session affinity fields plus a sanitized requester runtime envelope:
+Example injected metadata:
 
 ```json
 {
   "metadata": {
-    "session_id": "oc:edebc39a82a8a041",
-    "sticky_key": "oc:edebc39a82a8a041",
+    "session_id": "oc:0123456789abcdef",
+    "sticky_key": "oc:0123456789abcdef",
     "requester_runtime": {
-      "schema_version": "2026-05-18",
-      "source": "openclaw-token-cache-optimizer",
-      "capture_mode": "advisory_only",
-      "session_key": "oc:edebc39a82a8a041",
-      "repo_name": "my-repo",
-      "available_bridges": [],
-      "required_execution_mode": "advisory_only"
+      "schema_version": "2026-06-04",
+      "source": "openclaw-taas-affinity",
+      "session_key": "oc:0123456789abcdef",
+      "openclaw_session_id": "oc:0123456789abcdef",
+      "requester_host_id": "host:1a2b3c4d5e6f7890",
+      "repo_name": "example-repo",
+      "git_branch_hint": "dev",
+      "git_dirty_hint": false,
+      "provider": "cloudsigma",
+      "model_id": "cloudsigma/auto",
+      "session_source_hint": "source:1a2b3c4d5e6f7890",
+      "tool_execution": "direction_2_gateway",
+      "metadata_classification": {
+        "identifiers": "hashed",
+        "repository": "name_branch_dirty_only",
+        "local_paths": "omitted_by_default"
+      },
+      "redaction_policy": "no_secrets;no_raw_local_paths;no_env_values;no_git_remotes;no_status_or_diffs;no_extra_params"
     }
   }
 }
 ```
 
-- `session_id` — read by TaaS's OpenAI and Codex affinity paths
-- `sticky_key` — additionally read by the Anthropic substrate routing layer
-- `requester_runtime` — advisory requester-side runtime hints for downstream Claude Code routing/guardrails
+All metadata fields are no-overwrite. If the caller already supplied `metadata.session_id`, `metadata.sticky_key`, or `metadata.requester_runtime`, the plugin leaves them intact.
 
-All metadata fields are no-overwrite: if the caller already supplied them, the plugin leaves them intact. Additionally, the plugin injects an `X-Session-Id` request header via the `resolveTransportTurnState` hook, for transport layers that support per-turn native headers.
+The plugin does not include raw local paths (`workspace_dir`, `agent_dir`, `repo_root_hint`), environment variables, tokens, git remotes, full git status output, diffs, or arbitrary provider `extraParams`.
 
-### Requester runtime capture and bridge leasing
+## Direction-2 tool handling
 
-The runtime envelope is intentionally small and sanitized. It can include `workspace_dir` / `agent_dir` when OpenClaw exposes them to the provider hook, bounded repo hints derived from the workspace (`repo_root_hint`, `repo_name`, `git_branch_hint`, `git_dirty_hint`), hashed host/source identifiers, and provider/model hints.
+Requester-side tool execution is handled outside this plugin by the Claude Code / TaaS / OpenClaw Direction-2 path.
 
-It never includes raw environment variables, tokens, git remotes, full status output, diffs, or arbitrary provider `extraParams`. Git probes are bounded with a short timeout.
+The plugin intentionally leaves these payload structures untouched:
 
-For CloudSigma TaaS provider requests, bridge leasing is enabled by default. The plugin requests a short-lived requester bridge lease and forwards only the returned opaque descriptor in `requester_runtime.available_bridges`. If the lease service is unavailable, requests automatically fall back to advisory-only metadata with an empty bridge list.
+- OpenAI `tools`
+- `tool_choice`
+- assistant `tool_calls`
+- `role: "tool"` continuation messages
 
-The bridge is multi-tenant by design: proxy nodes receive only opaque descriptors and call TaaS; requester-owned tools execute in the requester runtime through this plugin's poller. Non-scaffold `requester.tool.invoke` operations are relayed to the requester-local OpenClaw Gateway `/tools/invoke` endpoint, not to any proxy-node backend. Use `TAAS_REQUESTER_LOCAL_GATEWAY_URL` / `TAAS_REQUESTER_LOCAL_GATEWAY_TOKEN` only on the requester host if its gateway is not reachable via the default local settings. The plugin falls back to `OPENCLAW_GATEWAY_URL`, `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_GATEWAY_PASSWORD`, then `http://127.0.0.1:18789`.
+It also does not inject:
 
-Default lease URL:
+- `requester_runtime.available_bridges`
+- `capture_mode: "bridge_capable"`
+- bridge operation names such as `requester.tool.invoke`, `openclaw.tool.invoke`, `bridge.ping`, or `bridge.echo`
 
-```text
-https://taas.cloudsigma.com/internal/requester-bridges/leases
-```
+## Autorouter route capture
 
-If the TaaS provider config exposes a custom `baseUrl`, the plugin derives the lease URL from that base. Set `TAAS_REQUESTER_BRIDGE_LEASE_URL` only for staging or custom deployments.
+TaaS may return response headers such as:
 
-### Session ID derivation
+- `X-TaaS-Autorouted: true`
+- `X-TaaS-Autorouter-Model`
+- `X-TaaS-Autorouter-Mode`
+- `X-TaaS-Autorouter-Algorithm-Source`
+- `X-TaaS-Thinking-Applied`
+- `X-TaaS-Routed-Context-Window`
 
-The ID is a SHA-256 hash of the session source, truncated to 16 hex chars and prefixed `oc:`. The plugin walks through a tier list to find the best available source:
+The plugin stores the latest bounded capture per affinity session and per derived OpenClaw agent ID.
 
-| Tier | Source | Notes |
-|---|---|---|
-| 1 | `ctx.workspaceDir` (explicit) | Best signal — populated for main agent and many subagents |
-| 2 | `globalThis[pluginRegistryState].workspaceDir` | Parent agent workspace via plugin registry |
-| 3 | `process.env.OPENCLAW_SESSION_ID` | If OpenClaw sets this env var for sub-agents in future |
-| 4 | `process.env.OPENCLAW_AGENT_ID` / `OPENCLAW_RUN_ID` | Any stable per-agent env var |
-| 5 | `OPENCLAW_STATE_DIR` hash | Per-installation fallback — least specific |
-
-| Property | Detail |
-|---|---|
-| **Stable** | Same value for every API turn within one conversation |
-| **Unique** | Different workspaces / env vars → different IDs |
-| **Resets on `/new`** | New conversation = new workspace = new ID |
-| **Namespaced** | `oc:` prefix avoids collision with Claude Code and other TaaS clients |
-
-Example IDs:
-```
-oc:edebc39a82a8a041   ← main agent session
-oc:4ae2870a2e73027c   ← subagent spawned from the above
-oc:a1b2c3d4e5f60718   ← same agent, next conversation
-```
-
-### Sub-agent behaviour
-
-OpenClaw sub-agents run in isolated processes and may not receive a `workspaceDir` in their `wrapStreamFn` context. Without this plugin, all sub-agent requests arrive at TaaS with `session_id = 'none'`, breaking affinity.
-
-The tier fallback system ensures sub-agents always get a deterministic session ID:
-
-1. **If the sub-agent has a workspace** (Tier 1) — derives a unique ID from it. Sub-agents get their own ID, separate from the parent.
-2. **If the parent agent workspace is visible** via globalThis (Tier 2) — reuses the parent's ID. This is correct behaviour: sub-agents from the same parent conversation share upstream slot affinity.
-3. **If OpenClaw injects env vars** (Tiers 3–4) — uses those for a stable per-agent ID.
-4. **Last resort** (Tier 5) — falls back to the state dir hash. All sub-agents on the same install share this ID, which still beats `session_id = 'none'` for cache-hit purposes.
-
-#### Enabling debug logging
-
-Set `OPENCLAW_DEBUG=1` (or `NODE_ENV=development`) to emit the session ID source on each request:
-
-```
-[taas-affinity] wrapStreamFn sessionId=oc:edebc39a82a8a041 source=workspaceDir:/home/user/.openclaw/...
-[taas-affinity] resolveTransportTurnState sessionId=oc:edebc39a82a8a041 source=workspaceDir:... turnId=abc attempt=1
-```
-
----
-
-## Requirements
-
-- **OpenClaw** ≥ 2026.4.27
-  - Requires the provider plugin hooks exposed via `openclaw/plugin-sdk/core`, including `wrapStreamFn`, `hookAliases`, and `resolveTransportTurnState`.
-- **Node.js** 22+
-- **TaaS** with session-affinity short-circuit support (commit `61a9960`+, April 2026)
-- A CloudSigma account with TaaS access
-
-Older OpenClaw builds may fail to load the plugin or may load it without applying the transport/header hook. Upgrade OpenClaw before deploying this plugin to production instances.
-
----
-
-## Installation
-
-### Option 1 - npm install (recommended)
+Query latest route by agent:
 
 ```bash
-openclaw plugins install openclaw-token-cache-optimizer
-openclaw gateway restart
+openclaw gateway call taas.autorouter.lastRoute \
+  --params '{"agentId":"new-agent-2"}' \
+  --json
 ```
 
-The published npm package ships pre-built JavaScript in `dist/` and works on OpenClaw `2026.4.27` and later (see [Compatibility](#compatibility)).
-
-### Option 2 - Manual install from source
+Query by explicit affinity session ID:
 
 ```bash
-git clone https://github.com/cloudsigma/openclaw-token-cache-optimizer \
-  ~/.openclaw/extensions/openclaw-token-cache-optimizer
-cd ~/.openclaw/extensions/openclaw-token-cache-optimizer
-npm install         # runs the `prepare` script which builds dist/
-openclaw gateway restart
+openclaw gateway call taas.autorouter.lastRoute \
+  --params '{"sessionId":"oc:0123456789abcdef"}' \
+  --json
 ```
 
-`npm install` triggers the `prepare` lifecycle script which compiles TypeScript to `dist/index.js`. OpenClaw `2026.5.x` and later require this compiled output for installed plugins; older gateways will still load it directly.
+Query by workspace path, deriving the same affinity session ID as the wrapper:
 
-That's it. No `openclaw.json` changes are required - the plugin auto-activates for all requests to the `cloudsigma` provider.
+```bash
+openclaw gateway call taas.autorouter.lastRoute \
+  --params '{"workspaceDir":"/home/cloudsigma/.openclaw/workspace-new-agent-2"}' \
+  --json
+```
 
-### Verify it loaded
+## Install / update from checkout
+
+```bash
+cd /home/cloudsigma/openclaw-taas-affinity
+npm ci
+npm test
+npm run build
+rsync -a --delete \
+  --exclude '.git' \
+  --exclude 'node_modules' \
+  --exclude 'package-lock.json' \
+  ./ ~/.openclaw/extensions/openclaw-taas-affinity/
+cd ~/.openclaw/extensions/openclaw-taas-affinity
+npm ci --omit=dev --ignore-scripts
+```
+
+Then restart the managed gateway service during a controlled window:
+
+```bash
+systemctl --user restart openclaw-gateway.service
+```
+
+Verify:
 
 ```bash
 openclaw gateway status
 openclaw plugins info openclaw-taas-affinity
+openclaw gateway call taas.autorouter.lastRoute --params '{"agentId":"new-agent-2"}' --json
 ```
 
-You should see `Status: loaded` and the source pointing at `dist/index.js` (or `/index.ts` on legacy gateways).
-
----
-
-## Compatibility
-
-| OpenClaw gateway | Status | Notes |
-|---|---|---|
-| >= 2026.5.x | Supported | Loads compiled `dist/index.js` |
-| 2026.4.27 - 2026.4.x | Supported | Loads compiled `dist/index.js`; bridge polling endpoints may not exist on the gateway-side TaaS API yet - plugin falls back to advisory-only metadata |
-| < 2026.4.27 | Not supported | Hooks the plugin relies on (`wrapStreamFn`, `hookAliases`, `resolveTransportTurnState`) are not exposed |
-
-The plugin is **forward and backward compatible** within this range from a single build artefact: bridge leasing, polling, and result submission all degrade gracefully when the corresponding TaaS endpoints are missing.
-## Verification
-
-### Local validation
-
-For repository/CI validation, install dev dependencies and run the test suite:
+## Development
 
 ```bash
-npm install
+npm run typecheck
+npm run smoke
+npm run unit
 npm test
+npm run build
 ```
 
-This runs:
+Current tests cover:
 
-- `npm run typecheck` — validates the TypeScript source against the OpenClaw plugin SDK and Node typings
-- `npm run smoke` — imports the plugin, registers the provider hook, and verifies payload/header injection
+- manifest startup activation
+- provider hook registration for `cloudsigma` and `cloudsigma-staging`
+- metadata/header injection
+- no-overwrite behavior
+- absence of requester bridge descriptors
+- OpenAI tool payload pass-through
+- autorouter capture and lookup by workspace/session/agent
 
-If validation fails because `openclaw/plugin-sdk/core` cannot be resolved, the local OpenClaw SDK dependency is missing or too old. Install/upgrade OpenClaw before deploying.
-
-### TaaS logs
-
-After installing, the first turn of every new conversation should show:
-
-```
-match_reason: "external_id_new"   ← first turn (new session in Redis)
-match_reason: "external_id"       ← subsequent turns (known session)
-```
-
-Previously turn 1 would show `match_reason: "new"` with `confidence: 0.30`.
-
-### Redis (from a TaaS pod)
-
-```bash
-redis-cli -h redis.taas.svc.cluster.local get "anth:session:oc:edebc39a82a8a041"
-```
-
-Replace the ID with your actual session ID. A non-null response confirms TaaS has bound the session to a slot.
-
----
-
-## Behaviour by session type
-
-| Session type | ID scope |
-|---|---|
-| Main agent | Own stable ID for the conversation lifetime |
-| Spawned subagent | Own ID (separate `workspaceDir`) |
-| Cron / isolated run | Own ID (isolated workspace per run) |
-| New conversation (`/new`, `/reset`) | New workspace → new ID |
-| Parallel conversations | Each gets a separate ID |
-
----
-
-## Configuration
-
-None required for standard CloudSigma TaaS use. The plugin works out of the box with zero configuration:
-
-- Bridge leasing is enabled by default for `cloudsigma` and `cloudsigma-staging` provider requests.
-- The standard lease endpoint is `https://taas.cloudsigma.com/internal/requester-bridges/leases`.
-- If the provider supplies a custom `baseUrl`, the lease URL is derived from that base instead.
-
-Optional environment variables:
+## Environment variables
 
 | Variable | Default | Purpose |
-|---|---|---|
-| `TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED` | enabled | Set to `0`, `false`, `no`, or `off` to disable bridge leasing explicitly. |
-| `TAAS_REQUESTER_BRIDGE_LEASE_URL` | derived from provider base URL, then `https://taas.cloudsigma.com/internal/requester-bridges/leases` | Override only for staging/custom deployments. |
-| `TAAS_REQUESTER_BRIDGE_POLL_INTERVAL_MS` | `1000` | Poll interval for bridge operations. |
+|---|---:|---|
+| `OPENCLAW_DEBUG` | unset | Emit debug logs for session source and autorouter capture |
+| `OPENCLAW_SESSION_ID` | unset | Preferred stable session source when supplied by OpenClaw |
+| `OPENCLAW_AGENT_ID` / `OPENCLAW_RUN_ID` | unset | Fallback stable agent/session source |
+| `OPENCLAW_STATE_DIR` | `~/.openclaw` | Last-resort stable fallback source |
 
----
-
-## Contributing
-
-Issues and PRs welcome. The core logic lives in [`index.ts`](./index.ts).
-
-## License
-
-MIT — see [LICENSE](./LICENSE).
+Requester bridge variables such as `TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED`, `TAAS_REQUESTER_BRIDGE_LEASE_URL`, and `TAAS_REQUESTER_BRIDGE_POLL_INTERVAL_MS` are obsolete and ignored by this plugin version.

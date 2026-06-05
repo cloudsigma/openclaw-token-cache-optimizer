@@ -1,5 +1,10 @@
 import assert from "node:assert/strict"
+import fs from "node:fs"
 import plugin from "../index.ts"
+
+const manifest = JSON.parse(fs.readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"))
+assert.equal(manifest.activation.onStartup, true, "plugin explicitly loads at gateway startup")
+assert.deepEqual(manifest.activation.onProviders, ["cloudsigma", "cloudsigma-staging"])
 
 assert.equal(plugin.id, "openclaw-taas-affinity")
 assert.equal(typeof plugin.register, "function")
@@ -42,7 +47,7 @@ assert.match(capturedPayload.metadata.session_id, /^oc:[a-f0-9]{16}$/)
 assert.equal(capturedPayload.metadata.sticky_key, capturedPayload.metadata.session_id)
 assert.equal(
 	capturedPayload.metadata.requester_runtime.source,
-	"openclaw-token-cache-optimizer"
+	"openclaw-taas-affinity"
 )
 assert.equal(
 	capturedPayload.metadata.requester_runtime.session_key,
@@ -58,8 +63,13 @@ assert.equal(
 )
 assert.equal(
 	capturedPayload.metadata.requester_runtime.redaction_policy,
-	"no_secrets;bounded_paths;no_env_values;no_git_remotes;no_status_or_diffs;no_extra_params"
+	"no_secrets;no_raw_local_paths;no_env_values;no_git_remotes;no_status_or_diffs;no_extra_params"
 )
+assert.equal(
+	capturedPayload.metadata.requester_runtime.tool_execution,
+	"direction_2_gateway"
+)
+assert.equal("available_bridges" in capturedPayload.metadata.requester_runtime, false)
 
 const transportState = provider.resolveTransportTurnState({
 	provider: "cloudsigma",
