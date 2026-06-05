@@ -70,6 +70,13 @@ assert.equal(
 	"direction_2_gateway"
 )
 assert.equal("available_bridges" in capturedPayload.metadata.requester_runtime, false)
+assert.equal(capturedPayload.metadata.openclaw_correlation.schema_version, "2026-06-05")
+assert.equal(capturedPayload.metadata.openclaw_correlation.source, "openclaw-taas-affinity")
+assert.equal(capturedPayload.metadata.openclaw_correlation.plugin_version, "0.5.2")
+assert.equal(capturedPayload.metadata.openclaw_correlation.session_id, capturedPayload.metadata.session_id)
+assert.equal(capturedPayload.metadata.openclaw_correlation.sticky_key, capturedPayload.metadata.session_id)
+assert.equal(capturedPayload.metadata.openclaw_correlation.provider, "cloudsigma")
+assert.equal(capturedPayload.metadata.openclaw_correlation.model_id, "cloudsigma/test-model")
 
 const transportState = provider.resolveTransportTurnState({
 	provider: "cloudsigma",
@@ -80,6 +87,10 @@ const transportState = provider.resolveTransportTurnState({
 })
 
 assert.match(transportState.headers["X-Session-Id"], /^oc:[a-f0-9]{16}$/)
+assert.equal(transportState.headers["X-OpenClaw-Session-Id"], transportState.headers["X-Session-Id"])
+assert.equal(transportState.headers["X-OpenClaw-Plugin-Version"], "0.5.2")
+assert.equal(transportState.headers["X-OpenClaw-Turn-Id"], "turn-smoke")
+assert.equal(transportState.headers["X-OpenClaw-Attempt"], "1")
 
 console.log("smoke ok")
 
@@ -117,6 +128,8 @@ const captureStreamFn = async (_model, _context, options = {}) => {
 					"x-taas-autorouter-algorithm-source": "api_key_default",
 					"x-taas-thinking-applied": "medium",
 					"x-taas-routed-context-window": "128000",
+					"x-request-id": "taas-req-123",
+					"x-trace-id": "taas-trace-456",
 				},
 			},
 			_model
@@ -155,6 +168,8 @@ assert.equal(respondedPayload.capture.autorouterAlgo, "best_fit")
 assert.equal(respondedPayload.capture.autorouterAlgoSource, "api_key_default")
 assert.equal(respondedPayload.capture.thinkingApplied, "medium")
 assert.equal(respondedPayload.capture.routedContextWindow, 128000)
+assert.equal(respondedPayload.capture.taasRequestId, "taas-req-123")
+assert.equal(respondedPayload.capture.taasTraceId, "taas-trace-456")
 
 // Non-autorouted response should NOT overwrite (we explicitly drop it)
 await captureWrapped("model", { messages: [] }, {})
