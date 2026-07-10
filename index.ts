@@ -29,7 +29,7 @@ const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-06-04"
 const REQUESTER_RUNTIME_SOURCE = "openclaw-taas-affinity"
 const GIT_PROBE_TIMEOUT_MS = 250
 const LAST_ROUTE_LIMIT = 256
-const PLUGIN_VERSION = "0.5.2"
+const PLUGIN_VERSION = "0.5.3"
 
 // OpenClaw stores active registry state (including workspaceDir) on globalThis
 // under this well-known symbol key.
@@ -68,11 +68,16 @@ function stableHash(value: string, prefix: string, length = 16): string {
 }
 
 function deriveSessionId(source: string): string {
-	const normalised = source.startsWith("env:") || source.startsWith("agent:")
+	const normalised = source.startsWith("env:") || source.startsWith("agent:") || source.startsWith("session:")
 		? source
 		: path.resolve(source)
 	const hex = createHash("sha256").update(normalised, "utf8").digest("hex")
 	return `${SESSION_ID_PREFIX}${hex.slice(0, 16)}`
+}
+
+function resolveLocalConversationSource(ctx: { sessionId?: unknown }): string | undefined {
+	const sessionId = safeString(ctx.sessionId)
+	return sessionId ? `session:${sessionId}` : undefined
 }
 
 function getActiveSessionSource(): string | undefined {
@@ -94,11 +99,24 @@ function fallbackSessionSource(): string {
 	return `stateDir:${stateDir}`
 }
 
-function resolveSessionId(workspaceDirFromCtx?: string): { sessionId: string; source: string } {
+function resolveSessionId(workspaceDirFromCtx?: string, sessionIdFromCtx?: unknown): { sessionId: string; source: string; sourceHint: string; localSessionScoped: boolean } {
+	const conversationSource = resolveLocalConversationSource({ sessionId: sessionIdFromCtx })
+	if (conversationSource) {
+		const diagnosticSource = workspaceDirFromCtx ? `workspaceDir:${workspaceDirFromCtx}` : (getActiveSessionSource() ?? fallbackSessionSource())
+		return {
+			sessionId: deriveSessionId(conversationSource),
+			source: conversationSource,
+			sourceHint: diagnosticSource,
+			localSessionScoped: true,
+		}
+	}
+
 	if (workspaceDirFromCtx) {
 		return {
 			sessionId: deriveSessionId(workspaceDirFromCtx),
 			source: `workspaceDir:${workspaceDirFromCtx}`,
+			sourceHint: `workspaceDir:${workspaceDirFromCtx}`,
+			localSessionScoped: false,
 		}
 	}
 
@@ -106,6 +124,8 @@ function resolveSessionId(workspaceDirFromCtx?: string): { sessionId: string; so
 	return {
 		sessionId: deriveSessionId(activeSource),
 		source: activeSource,
+		sourceHint: activeSource,
+		localSessionScoped: false,
 	}
 }
 
@@ -170,6 +190,7 @@ function deriveAgentIdForCapture(ctx: { agentDir?: string; workspaceDir?: string
 function buildCorrelationMetadata(
 	sessionId: string,
 	source: string,
+	sourceHint: string,
 	ctx: ProviderWrapStreamFnContext,
 	agentId: string | null
 ): Record<string, unknown> {
@@ -183,7 +204,8 @@ function buildCorrelationMetadata(
 		plugin_version: PLUGIN_VERSION,
 		session_id: sessionId,
 		sticky_key: sessionId,
-		session_source_hint: stableHash(source, "source"),
+		session_source_hint: stableHash(sourceHint, "source"),
+		session_identity_scope: source.startsWith("session:") ? "local_session" : "legacy_source",
 		...(agentId && { agent_id: agentId }),
 		...(provider && { provider }),
 		...(modelId && { model_id: modelId }),
@@ -213,7 +235,8 @@ function buildCorrelationHeaders(args: {
 function buildRequesterRuntime(
 	ctx: ProviderWrapStreamFnContext,
 	sessionId: string,
-	source: string
+	source: string,
+	sourceHint: string
 ): RequesterRuntime {
 	const ctxRecord = ctx as unknown as Record<string, unknown>
 	const modelRecord = asRecord(ctxRecord.model)
@@ -233,7 +256,8 @@ function buildRequesterRuntime(
 		...(repoRoot && { git_dirty_hint: readGitDirtyHint(repoRoot) }),
 		...(provider && { provider }),
 		...(modelId && { model_id: modelId }),
-		session_source_hint: stableHash(source, "source"),
+		session_source_hint: stableHash(sourceHint, "source"),
+		session_identity_scope: source.startsWith("session:") ? "local_session" : "legacy_source",
 		tool_execution: "direction_2_gateway",
 		metadata_classification: {
 			identifiers: "hashed",
@@ -248,11 +272,12 @@ function patchPayloadMetadata(
 	payload: Record<string, unknown>,
 	sessionId: string,
 	requesterRuntime?: RequesterRuntime,
-	correlation?: Record<string, unknown>
+	correlation?: Record<string, unknown>,
+	injectAffinityMetadata = true
 ): Record<string, unknown> {
 	const existingMeta = asRecord(payload.metadata) ?? {}
-	const needsSessionId = !existingMeta.session_id
-	const needsStickyKey = !existingMeta.sticky_key
+	const needsSessionId = injectAffinityMetadata && !existingMeta.session_id
+	const needsStickyKey = injectAffinityMetadata && !existingMeta.sticky_key
 	const needsRequesterRuntime = requesterRuntime && !existingMeta.requester_runtime
 	const needsCorrelation = correlation && !existingMeta.openclaw_correlation
 	if (!needsSessionId && !needsStickyKey && !needsRequesterRuntime && !needsCorrelation) return payload
@@ -346,10 +371,10 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 	const { streamFn } = ctx
 	if (!streamFn) return undefined
 
-	const { sessionId, source } = resolveSessionId(ctx.workspaceDir)
+	const { sessionId, source, sourceHint, localSessionScoped } = resolveSessionId(ctx.workspaceDir, (ctx as { sessionId?: unknown }).sessionId)
 	const agentIdForCapture = deriveAgentIdForCapture(ctx as { agentDir?: string; workspaceDir?: string })
-	const requesterRuntime = buildRequesterRuntime(ctx, sessionId, source)
-	const correlation = buildCorrelationMetadata(sessionId, source, ctx, agentIdForCapture)
+	const requesterRuntime = localSessionScoped ? buildRequesterRuntime(ctx, sessionId, source, sourceHint) : undefined
+	const correlation = localSessionScoped ? buildCorrelationMetadata(sessionId, source, sourceHint, ctx, agentIdForCapture) : undefined
 
 	if (isDev) console.debug(`[taas-affinity] wrapStreamFn sessionId=${sessionId} source=${source}`)
 
@@ -360,7 +385,7 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 		const onPayload: NonNullable<typeof options>["onPayload"] = async (payload, payloadModel) => {
 			const payloadRecord = asRecord(payload)
 			if (!payloadRecord) return prevOnPayload ? prevOnPayload(payload, payloadModel) : payload
-			const patched = patchPayloadMetadata(payloadRecord, sessionId, requesterRuntime, correlation)
+			const patched = patchPayloadMetadata(payloadRecord, sessionId, requesterRuntime, correlation, localSessionScoped)
 			return prevOnPayload ? prevOnPayload(patched, payloadModel) : patched
 		}
 		const prevOnResponse = options?.onResponse
@@ -377,7 +402,7 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 }
 
 function buildTransportTurnState(ctx: ProviderResolveTransportTurnStateContext): ProviderTransportTurnState | null {
-	const activeSource = getActiveSessionSource() ?? fallbackSessionSource()
+	const activeSource = resolveLocalConversationSource(ctx as { sessionId?: unknown }) ?? getActiveSessionSource() ?? fallbackSessionSource()
 	const sessionId = deriveSessionId(activeSource)
 	const agentId = deriveAgentIdForCapture(ctx as unknown as { agentDir?: string; workspaceDir?: string })
 	if (isDev) {
@@ -424,7 +449,7 @@ export default {
 					return
 				}
 
-				const resolvedSessionId = directSessionId ?? resolveSessionId(workspaceDir).sessionId
+				const resolvedSessionId = directSessionId ?? resolveSessionId(workspaceDir, safeString(pp.localSessionId)).sessionId
 				respond(true, {
 					sessionId: resolvedSessionId,
 					capture: getLastRouteForSession(resolvedSessionId),

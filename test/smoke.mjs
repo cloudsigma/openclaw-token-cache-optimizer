@@ -43,40 +43,10 @@ assert.equal(typeof wrapped, "function")
 await wrapped("model", { messages: [] }, {})
 
 assert.equal(capturedPayload.metadata.existing, "keep")
-assert.match(capturedPayload.metadata.session_id, /^oc:[a-f0-9]{16}$/)
-assert.equal(capturedPayload.metadata.sticky_key, capturedPayload.metadata.session_id)
-assert.equal(
-	capturedPayload.metadata.requester_runtime.source,
-	"openclaw-taas-affinity"
-)
-assert.equal(
-	capturedPayload.metadata.requester_runtime.session_key,
-	capturedPayload.metadata.session_id
-)
-assert.equal(
-	capturedPayload.metadata.requester_runtime.provider,
-	"cloudsigma"
-)
-assert.equal(
-	capturedPayload.metadata.requester_runtime.model_id,
-	"cloudsigma/test-model"
-)
-assert.equal(
-	capturedPayload.metadata.requester_runtime.redaction_policy,
-	"no_secrets;no_raw_local_paths;no_env_values;no_git_remotes;no_status_or_diffs;no_extra_params"
-)
-assert.equal(
-	capturedPayload.metadata.requester_runtime.tool_execution,
-	"direction_2_gateway"
-)
-assert.equal("available_bridges" in capturedPayload.metadata.requester_runtime, false)
-assert.equal(capturedPayload.metadata.openclaw_correlation.schema_version, "2026-06-05")
-assert.equal(capturedPayload.metadata.openclaw_correlation.source, "openclaw-taas-affinity")
-assert.equal(capturedPayload.metadata.openclaw_correlation.plugin_version, "0.5.2")
-assert.equal(capturedPayload.metadata.openclaw_correlation.session_id, capturedPayload.metadata.session_id)
-assert.equal(capturedPayload.metadata.openclaw_correlation.sticky_key, capturedPayload.metadata.session_id)
-assert.equal(capturedPayload.metadata.openclaw_correlation.provider, "cloudsigma")
-assert.equal(capturedPayload.metadata.openclaw_correlation.model_id, "cloudsigma/test-model")
+assert.equal("session_id" in capturedPayload.metadata, false)
+assert.equal("sticky_key" in capturedPayload.metadata, false)
+assert.equal("requester_runtime" in capturedPayload.metadata, false)
+assert.equal("openclaw_correlation" in capturedPayload.metadata, false)
 
 const transportState = provider.resolveTransportTurnState({
 	provider: "cloudsigma",
@@ -88,9 +58,57 @@ const transportState = provider.resolveTransportTurnState({
 
 assert.match(transportState.headers["X-Session-Id"], /^oc:[a-f0-9]{16}$/)
 assert.equal(transportState.headers["X-OpenClaw-Session-Id"], transportState.headers["X-Session-Id"])
-assert.equal(transportState.headers["X-OpenClaw-Plugin-Version"], "0.5.2")
+assert.equal(transportState.headers["X-OpenClaw-Plugin-Version"], "0.5.3")
 assert.equal(transportState.headers["X-OpenClaw-Turn-Id"], "turn-smoke")
 assert.equal(transportState.headers["X-OpenClaw-Attempt"], "1")
+
+const localSessionWrapped = provider.wrapStreamFn({
+	streamFn,
+	sessionId: "local-session-a",
+	workspaceDir: "/tmp/openclaw-token-cache-optimizer-smoke",
+	provider: "cloudsigma",
+	modelId: "cloudsigma/test-model",
+	model: { id: "cloudsigma/test-model" },
+})
+await localSessionWrapped("model", { messages: [] }, {})
+const localSessionA = capturedPayload.metadata.session_id
+assert.match(localSessionA, /^oc:[a-f0-9]{16}$/)
+assert.equal(capturedPayload.metadata.sticky_key, localSessionA)
+assert.equal(capturedPayload.metadata.requester_runtime.source, "openclaw-taas-affinity")
+assert.equal(capturedPayload.metadata.requester_runtime.session_key, localSessionA)
+assert.equal(capturedPayload.metadata.requester_runtime.provider, "cloudsigma")
+assert.equal(capturedPayload.metadata.requester_runtime.model_id, "cloudsigma/test-model")
+assert.equal(capturedPayload.metadata.requester_runtime.redaction_policy, "no_secrets;no_raw_local_paths;no_env_values;no_git_remotes;no_status_or_diffs;no_extra_params")
+assert.equal(capturedPayload.metadata.requester_runtime.tool_execution, "direction_2_gateway")
+assert.equal("available_bridges" in capturedPayload.metadata.requester_runtime, false)
+assert.equal(capturedPayload.metadata.openclaw_correlation.schema_version, "2026-06-05")
+assert.equal(capturedPayload.metadata.openclaw_correlation.source, "openclaw-taas-affinity")
+assert.equal(capturedPayload.metadata.openclaw_correlation.plugin_version, "0.5.3")
+assert.equal(capturedPayload.metadata.openclaw_correlation.session_id, localSessionA)
+assert.equal(capturedPayload.metadata.openclaw_correlation.sticky_key, localSessionA)
+assert.equal(capturedPayload.metadata.openclaw_correlation.provider, "cloudsigma")
+assert.equal(capturedPayload.metadata.openclaw_correlation.model_id, "cloudsigma/test-model")
+await provider.wrapStreamFn({
+	streamFn,
+	sessionId: "local-session-b",
+	workspaceDir: "/tmp/openclaw-token-cache-optimizer-smoke",
+	provider: "cloudsigma",
+	modelId: "cloudsigma/test-model",
+	model: { id: "cloudsigma/test-model" },
+})("model", { messages: [] }, {})
+assert.notEqual(capturedPayload.metadata.session_id, localSessionA)
+assert.equal(capturedPayload.metadata.openclaw_correlation.session_identity_scope, "local_session")
+assert.equal(capturedPayload.metadata.requester_runtime.session_identity_scope, "local_session")
+
+const localTransportState = provider.resolveTransportTurnState({
+	provider: "cloudsigma",
+	modelId: "cloudsigma/test-model",
+	sessionId: "local-session-a",
+	turnId: "turn-local",
+	attempt: 1,
+	transport: "stream",
+})
+assert.equal(localTransportState.headers["X-Session-Id"], localSessionA)
 
 console.log("smoke ok")
 
