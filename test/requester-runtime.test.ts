@@ -108,3 +108,48 @@ test("existing affinity metadata is never overwritten", async () => {
 		restore()
 	}
 })
+
+
+test("native OpenClaw session IDs pass through unchanged", async () => {
+	const { plugin, restore } = await loadPlugin({ OPENCLAW_SESSION_ID: "legacy-env-id" })
+	try {
+		const provider = captureProvider(plugin)
+		const nativeId = "a5add102-d79b-4168-8a2a-6dd75135f73b"
+		const payload = await runPayload(provider, { messages: [], metadata: {} }, { sessionId: nativeId })
+		assert.equal(payload.metadata.session_id, nativeId)
+		assert.equal(payload.metadata.sticky_key, nativeId)
+		assert.equal(payload.metadata.requester_runtime.openclaw_session_id, nativeId)
+		assert.equal(payload.metadata.requester_runtime.session_identity_scope, "native_openclaw_session")
+		assert.equal(payload.metadata.openclaw_correlation.session_id, nativeId)
+		const transport = provider.resolveTransportTurnState({ sessionId: nativeId, turnId: "turn-native", attempt: 1 })
+		assert.equal(transport.headers["X-Session-Id"], nativeId)
+	} finally {
+		restore()
+	}
+})
+
+test("legacy environment identity is generated only when native session ID is unavailable", async () => {
+	const { plugin, restore } = await loadPlugin({ OPENCLAW_SESSION_ID: "legacy-env-id" })
+	try {
+		const provider = captureProvider(plugin)
+		const payload = await runPayload(provider, { messages: [], metadata: {} })
+		assert.match(payload.metadata.session_id, /^oc:[a-f0-9]{16}$/)
+		assert.equal(payload.metadata.requester_runtime.session_identity_scope, "legacy_generated_session")
+		const transport = provider.resolveTransportTurnState({ turnId: "turn-legacy", attempt: 1 })
+		assert.equal(transport.headers["X-Session-Id"], payload.metadata.session_id)
+	} finally {
+		restore()
+	}
+})
+
+test("no session identity means no affinity injection", async () => {
+	const { plugin, restore } = await loadPlugin({ OPENCLAW_SESSION_ID: undefined })
+	try {
+		const provider = captureProvider(plugin)
+		const payload = await runPayload(provider, { messages: [], metadata: { existing: true } })
+		assert.deepEqual(payload.metadata, { existing: true })
+		assert.equal(provider.resolveTransportTurnState({ turnId: "turn-none", attempt: 1 }), null)
+	} finally {
+		restore()
+	}
+})

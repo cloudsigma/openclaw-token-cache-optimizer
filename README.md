@@ -8,7 +8,8 @@ This plugin is intentionally narrow after the Claude Code Direction-2 lane updat
 
 For requests routed through the `cloudsigma` or `cloudsigma-staging` provider IDs, the plugin:
 
-- derives a stable affinity session ID with the form `oc:<sha256-prefix>`
+- passes OpenClaw's native `ctx.sessionId` through unchanged when available
+- generates a stable `oc:<sha256-prefix>` only as a deprecated compatibility fallback from `OPENCLAW_SESSION_ID`
 - injects `metadata.session_id` when absent
 - injects `metadata.sticky_key` when absent
 - injects a sanitized `metadata.requester_runtime` envelope when absent
@@ -65,7 +66,7 @@ Example injected metadata:
     "openclaw_correlation": {
       "schema_version": "2026-06-05",
       "source": "openclaw-taas-affinity",
-      "plugin_version": "0.5.2",
+      "plugin_version": "0.6.0",
       "session_id": "oc:0123456789abcdef",
       "sticky_key": "oc:0123456789abcdef",
       "session_source_hint": "source:1a2b3c4d5e6f7890",
@@ -127,11 +128,11 @@ openclaw gateway call taas.autorouter.lastRoute \
   --json
 ```
 
-Query by workspace path, deriving the same affinity session ID as the wrapper:
+Query by native OpenClaw session ID:
 
 ```bash
 openclaw gateway call taas.autorouter.lastRoute \
-  --params '{"workspaceDir":"/home/cloudsigma/.openclaw/workspace-new-agent-2"}' \
+  --params '{"localSessionId":"a5add102-d79b-4168-8a2a-6dd75135f73b"}' \
   --json
 ```
 
@@ -190,8 +191,8 @@ Current tests cover:
 | Variable | Default | Purpose |
 |---|---:|---|
 | `OPENCLAW_DEBUG` | unset | Emit debug logs for session source and autorouter capture |
-| `OPENCLAW_SESSION_ID` | unset | Preferred stable session source when supplied by OpenClaw |
-| `OPENCLAW_AGENT_ID` / `OPENCLAW_RUN_ID` | unset | Fallback stable agent/session source |
-| `OPENCLAW_STATE_DIR` | `~/.openclaw` | Last-resort stable fallback source |
+| `OPENCLAW_SESSION_ID` | unset | Deprecated compatibility fallback for runtimes that do not supply native `ctx.sessionId` |
+| `OPENCLAW_AGENT_ID` / `OPENCLAW_RUN_ID` | unset | Agent label used only for autorouter capture lookup; never a session-identity source |
+| `OPENCLAW_STATE_DIR` | `~/.openclaw` | Used only to construct a hashed diagnostic source hint |
 
 Requester bridge variables such as `TAAS_REQUESTER_BRIDGE_PLUGIN_ENABLED`, `TAAS_REQUESTER_BRIDGE_LEASE_URL`, and `TAAS_REQUESTER_BRIDGE_POLL_INTERVAL_MS` are obsolete and ignored by this plugin version.

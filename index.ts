@@ -29,7 +29,7 @@ const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-06-04"
 const REQUESTER_RUNTIME_SOURCE = "openclaw-taas-affinity"
 const GIT_PROBE_TIMEOUT_MS = 250
 const LAST_ROUTE_LIMIT = 256
-const PLUGIN_VERSION = "0.5.3"
+const PLUGIN_VERSION = "0.6.0"
 
 // OpenClaw stores active registry state (including workspaceDir) on globalThis
 // under this well-known symbol key.
@@ -67,73 +67,59 @@ function stableHash(value: string, prefix: string, length = 16): string {
 	return `${prefix}:${hex.slice(0, length)}`
 }
 
-function deriveSessionId(source: string): string {
-	const normalised = source.startsWith("env:") || source.startsWith("agent:") || source.startsWith("session:")
-		? source
-		: path.resolve(source)
-	const hex = createHash("sha256").update(normalised, "utf8").digest("hex")
+function deriveFallbackSessionId(source: string): string {
+	const hex = createHash("sha256").update(source, "utf8").digest("hex")
 	return `${SESSION_ID_PREFIX}${hex.slice(0, 16)}`
 }
 
-const BOOT_SALT = createHash("sha256").update(`${process.pid}:${Date.now()}:${Math.random()}`).digest("hex").slice(0, 12)
-
-function deriveEphemeralSessionId(source: string): string {
-	const hex = createHash("sha256").update(`ephemeral:${BOOT_SALT}:${source}`, "utf8").digest("hex")
-	return `${SESSION_ID_PREFIX}${hex.slice(0, 16)}`
+type ResolvedSessionIdentity = {
+	sessionId: string
+	source: string
+	sourceHint: string
+	localSessionScoped: boolean
+	identityMode: "native" | "legacy_env"
 }
 
-function resolveLocalConversationSource(ctx: { sessionId?: unknown }): string | undefined {
-	const sessionId = safeString(ctx.sessionId)
-	return sessionId ? `session:${sessionId}` : undefined
-}
+/**
+ * Prefer OpenClaw's native conversation identity exactly as supplied by the
+ * current provider runtime contract. Generation is retained only for older
+ * runtimes that expose OPENCLAW_SESSION_ID but do not populate ctx.sessionId.
+ *
+ * We intentionally do not derive identity from workspace, agent, run, or state
+ * paths: those scopes can outlive a conversation and accidentally join two
+ * otherwise independent sessions in TaaS.
+ */
+function resolveSessionIdentity(
+	workspaceDirFromCtx?: string,
+	sessionIdFromCtx?: unknown,
+): ResolvedSessionIdentity | null {
+	const nativeSessionId = safeString(sessionIdFromCtx)
+	const sourceHint = workspaceDirFromCtx
+		? `workspaceDir:${workspaceDirFromCtx}`
+		: `stateDir:${process.env.OPENCLAW_STATE_DIR ?? path.join(os.homedir(), ".openclaw")}`
 
-function getActiveSessionSource(): string | undefined {
-	const envSessionId = process.env.OPENCLAW_SESSION_ID
-	if (envSessionId) return `env:${envSessionId}`
-
-	const envAgentId = process.env.OPENCLAW_AGENT_ID ?? process.env.OPENCLAW_RUN_ID
-	if (envAgentId) return `agent:${envAgentId}`
-
-	const state = (globalThis as Record<symbol, unknown>)[PLUGIN_REGISTRY_STATE] as
-		| { workspaceDir?: string }
-		| null
-		| undefined
-	return state?.workspaceDir
-}
-
-function fallbackSessionSource(): string {
-	const stateDir = process.env.OPENCLAW_STATE_DIR ?? path.join(os.homedir(), ".openclaw")
-	return `stateDir:${stateDir}`
-}
-
-function resolveSessionId(workspaceDirFromCtx?: string, sessionIdFromCtx?: unknown): { sessionId: string; source: string; sourceHint: string; localSessionScoped: boolean } {
-	const conversationSource = resolveLocalConversationSource({ sessionId: sessionIdFromCtx })
-	if (conversationSource) {
-		const diagnosticSource = workspaceDirFromCtx ? `workspaceDir:${workspaceDirFromCtx}` : (getActiveSessionSource() ?? fallbackSessionSource())
+	if (nativeSessionId) {
 		return {
-			sessionId: deriveSessionId(conversationSource),
-			source: conversationSource,
-			sourceHint: diagnosticSource,
+			sessionId: nativeSessionId,
+			source: "openclaw:ctx.sessionId",
+			sourceHint,
 			localSessionScoped: true,
+			identityMode: "native",
 		}
 	}
 
-	if (workspaceDirFromCtx) {
+	const legacySessionId = safeString(process.env.OPENCLAW_SESSION_ID)
+	if (legacySessionId) {
 		return {
-			sessionId: deriveEphemeralSessionId(`workspaceDir:${workspaceDirFromCtx}`),
-			source: `workspaceDir:${workspaceDirFromCtx}`,
-			sourceHint: `workspaceDir:${workspaceDirFromCtx}`,
-			localSessionScoped: false,
+			sessionId: deriveFallbackSessionId(`legacy-env:${legacySessionId}`),
+			source: "openclaw:env.OPENCLAW_SESSION_ID",
+			sourceHint,
+			localSessionScoped: true,
+			identityMode: "legacy_env",
 		}
 	}
 
-	const activeSource = getActiveSessionSource() ?? fallbackSessionSource()
-	return {
-		sessionId: deriveEphemeralSessionId(activeSource),
-		source: activeSource,
-		sourceHint: activeSource,
-		localSessionScoped: false,
-	}
+	return null
 }
 
 function findRepoRoot(startDir?: string): string | undefined {
@@ -212,7 +198,7 @@ function buildCorrelationMetadata(
 		session_id: sessionId,
 		sticky_key: sessionId,
 		session_source_hint: stableHash(sourceHint, "source"),
-		session_identity_scope: source.startsWith("session:") ? "local_session" : "legacy_source",
+		session_identity_scope: source === "openclaw:ctx.sessionId" ? "native_openclaw_session" : "legacy_generated_session",
 		...(agentId && { agent_id: agentId }),
 		...(provider && { provider }),
 		...(modelId && { model_id: modelId }),
@@ -264,7 +250,7 @@ function buildRequesterRuntime(
 		...(provider && { provider }),
 		...(modelId && { model_id: modelId }),
 		session_source_hint: stableHash(sourceHint, "source"),
-		session_identity_scope: source.startsWith("session:") ? "local_session" : "legacy_source",
+		session_identity_scope: source === "openclaw:ctx.sessionId" ? "native_openclaw_session" : "legacy_generated_session",
 		tool_execution: "direction_2_gateway",
 		metadata_classification: {
 			identifiers: "hashed",
@@ -378,12 +364,12 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 	const { streamFn } = ctx
 	if (!streamFn) return undefined
 
-	const { sessionId, source, sourceHint, localSessionScoped } = resolveSessionId(ctx.workspaceDir, (ctx as { sessionId?: unknown }).sessionId)
+	const identity = resolveSessionIdentity(ctx.workspaceDir, (ctx as { sessionId?: unknown }).sessionId)
 	const agentIdForCapture = deriveAgentIdForCapture(ctx as { agentDir?: string; workspaceDir?: string })
-	const requesterRuntime = localSessionScoped ? buildRequesterRuntime(ctx, sessionId, source, sourceHint) : undefined
-	const correlation = localSessionScoped ? buildCorrelationMetadata(sessionId, source, sourceHint, ctx, agentIdForCapture) : undefined
+	const requesterRuntime = identity ? buildRequesterRuntime(ctx, identity.sessionId, identity.source, identity.sourceHint) : undefined
+	const correlation = identity ? buildCorrelationMetadata(identity.sessionId, identity.source, identity.sourceHint, ctx, agentIdForCapture) : undefined
 
-	if (isDev) console.debug(`[taas-affinity] wrapStreamFn sessionId=${sessionId} source=${source}`)
+	if (isDev) console.debug(`[taas-affinity] wrapStreamFn sessionId=${identity?.sessionId ?? "none"} mode=${identity?.identityMode ?? "none"}`)
 
 	const inner = streamFn
 	return function taasAffinityStreamFn(...args: Parameters<typeof inner>) {
@@ -392,13 +378,15 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 		const onPayload: NonNullable<typeof options>["onPayload"] = async (payload, payloadModel) => {
 			const payloadRecord = asRecord(payload)
 			if (!payloadRecord) return prevOnPayload ? prevOnPayload(payload, payloadModel) : payload
-			const patched = patchPayloadMetadata(payloadRecord, sessionId, requesterRuntime, correlation, localSessionScoped)
+			const patched = identity
+				? patchPayloadMetadata(payloadRecord, identity.sessionId, requesterRuntime, correlation, true)
+				: payloadRecord
 			return prevOnPayload ? prevOnPayload(patched, payloadModel) : patched
 		}
 		const prevOnResponse = options?.onResponse
 		const onResponse: NonNullable<typeof options>["onResponse"] = async (response, responseModel) => {
 			try {
-				captureAutorouterFromHeaders(sessionId, response?.headers ?? {}, agentIdForCapture)
+				identity && captureAutorouterFromHeaders(identity.sessionId, response?.headers ?? {}, agentIdForCapture)
 			} catch (err) {
 				if (isDev) console.debug(`[taas-affinity] onResponse capture failed: ${(err as Error)?.message ?? err}`)
 			}
@@ -409,20 +397,19 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 }
 
 function buildTransportTurnState(ctx: ProviderResolveTransportTurnStateContext): ProviderTransportTurnState | null {
-	const localSource = resolveLocalConversationSource(ctx as { sessionId?: unknown })
-	if (!localSource) {
-		if (isDev) console.debug(`[taas-affinity] no ctx.sessionId; skipping X-Session-Id injection turnId=${ctx.turnId}`)
+	const identity = resolveSessionIdentity(undefined, (ctx as { sessionId?: unknown }).sessionId)
+	if (!identity) {
+		if (isDev) console.debug(`[taas-affinity] no native or legacy session identity; skipping affinity headers turnId=${ctx.turnId}`)
 		return null
 	}
-	const sessionId = deriveSessionId(localSource)
 	const agentId = deriveAgentIdForCapture(ctx as unknown as { agentDir?: string; workspaceDir?: string })
 	if (isDev) {
 		console.debug(
-			`[taas-affinity] resolveTransportTurnState sessionId=${sessionId} ` +
-				`source=${localSource} turnId=${ctx.turnId} attempt=${ctx.attempt}`
+			`[taas-affinity] resolveTransportTurnState sessionId=${identity.sessionId} ` +
+				`mode=${identity.identityMode} turnId=${ctx.turnId} attempt=${ctx.attempt}`
 		)
 	}
-	return { headers: buildCorrelationHeaders({ sessionId, turnId: ctx.turnId, attempt: ctx.attempt, agentId }) }
+	return { headers: buildCorrelationHeaders({ sessionId: identity.sessionId, turnId: ctx.turnId, attempt: ctx.attempt, agentId }) }
 }
 
 export default {
@@ -460,10 +447,13 @@ export default {
 					return
 				}
 
-				const resolvedSessionId = directSessionId ?? resolveSessionId(workspaceDir, safeString(pp.localSessionId)).sessionId
+				const resolvedIdentity = directSessionId
+					? null
+					: resolveSessionIdentity(workspaceDir, safeString(pp.localSessionId))
+				const resolvedSessionId = directSessionId ?? resolvedIdentity?.sessionId ?? null
 				respond(true, {
 					sessionId: resolvedSessionId,
-					capture: getLastRouteForSession(resolvedSessionId),
+					capture: resolvedSessionId ? getLastRouteForSession(resolvedSessionId) : null,
 				})
 			},
 			{ scope: "operator.read" }
@@ -473,7 +463,8 @@ export default {
 	_testExports: {
 		buildRequesterRuntime,
 		patchPayloadMetadata,
-		resolveSessionId,
+		resolveSessionIdentity,
+		deriveFallbackSessionId,
 		captureAutorouterFromHeaders,
 		buildCorrelationHeaders,
 		buildCorrelationMetadata,

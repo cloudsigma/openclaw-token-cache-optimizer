@@ -66,9 +66,9 @@ const transportState = provider.resolveTransportTurnState({ sessionId: "smoke-lo
 	transport: "stream",
 })
 
-assert.match(transportState.headers["X-Session-Id"], /^oc:[a-f0-9]{16}$/)
+assert.equal(transportState.headers["X-Session-Id"], "smoke-local-session")
 assert.equal(transportState.headers["X-OpenClaw-Session-Id"], transportState.headers["X-Session-Id"])
-assert.equal(transportState.headers["X-OpenClaw-Plugin-Version"], "0.5.3")
+assert.equal(transportState.headers["X-OpenClaw-Plugin-Version"], "0.6.0")
 assert.equal(transportState.headers["X-OpenClaw-Turn-Id"], "turn-smoke")
 assert.equal(transportState.headers["X-OpenClaw-Attempt"], "1")
 
@@ -82,7 +82,7 @@ const localSessionWrapped = provider.wrapStreamFn({
 })
 await localSessionWrapped("model", { messages: [] }, {})
 const localSessionA = capturedPayload.metadata.session_id
-assert.match(localSessionA, /^oc:[a-f0-9]{16}$/)
+assert.equal(localSessionA, "local-session-a")
 assert.equal(capturedPayload.metadata.sticky_key, localSessionA)
 assert.equal(capturedPayload.metadata.requester_runtime.source, "openclaw-taas-affinity")
 assert.equal(capturedPayload.metadata.requester_runtime.session_key, localSessionA)
@@ -93,7 +93,7 @@ assert.equal(capturedPayload.metadata.requester_runtime.tool_execution, "directi
 assert.equal("available_bridges" in capturedPayload.metadata.requester_runtime, false)
 assert.equal(capturedPayload.metadata.openclaw_correlation.schema_version, "2026-06-05")
 assert.equal(capturedPayload.metadata.openclaw_correlation.source, "openclaw-taas-affinity")
-assert.equal(capturedPayload.metadata.openclaw_correlation.plugin_version, "0.5.3")
+assert.equal(capturedPayload.metadata.openclaw_correlation.plugin_version, "0.6.0")
 assert.equal(capturedPayload.metadata.openclaw_correlation.session_id, localSessionA)
 assert.equal(capturedPayload.metadata.openclaw_correlation.sticky_key, localSessionA)
 assert.equal(capturedPayload.metadata.openclaw_correlation.provider, "cloudsigma")
@@ -107,8 +107,8 @@ await provider.wrapStreamFn({
 	model: { id: "cloudsigma/test-model" },
 })("model", { messages: [] }, {})
 assert.notEqual(capturedPayload.metadata.session_id, localSessionA)
-assert.equal(capturedPayload.metadata.openclaw_correlation.session_identity_scope, "local_session")
-assert.equal(capturedPayload.metadata.requester_runtime.session_identity_scope, "local_session")
+assert.equal(capturedPayload.metadata.openclaw_correlation.session_identity_scope, "native_openclaw_session")
+assert.equal(capturedPayload.metadata.requester_runtime.session_identity_scope, "native_openclaw_session")
 
 const localTransportState = provider.resolveTransportTurnState({
 	provider: "cloudsigma",
@@ -166,6 +166,7 @@ const captureStreamFn = async (_model, _context, options = {}) => {
 }
 const captureWrapped = provider.wrapStreamFn({
 	streamFn: captureStreamFn,
+	sessionId: "capture-smoke-session",
 	workspaceDir: "/tmp/openclaw-token-cache-optimizer-smoke",
 	provider: "cloudsigma",
 	modelId: "cloudsigma/auto",
@@ -178,7 +179,7 @@ let respondedOk
 let respondedPayload
 await registeredHandler({
 	req: { id: "test" },
-	params: { workspaceDir: "/tmp/openclaw-token-cache-optimizer-smoke" },
+	params: { sessionId: "capture-smoke-session" },
 	client: null,
 	isWebchatConnect: () => false,
 	respond: (ok, payload) => {
@@ -189,7 +190,7 @@ await registeredHandler({
 })
 assert.equal(respondedOk, true, "handler responded ok")
 assert.ok(respondedPayload, "payload present")
-assert.match(respondedPayload.sessionId, /^oc:[a-f0-9]{16}$/, "sessionId looks valid")
+assert.equal(respondedPayload.sessionId, "capture-smoke-session", "native sessionId preserved")
 assert.ok(respondedPayload.capture, "capture present")
 assert.equal(respondedPayload.capture.autorouterModel, "cloudsigma/gpt-5")
 assert.equal(respondedPayload.capture.autorouterAlgo, "best_fit")
@@ -203,7 +204,7 @@ assert.equal(respondedPayload.capture.taasTraceId, "taas-trace-456")
 await captureWrapped("model", { messages: [] }, {})
 await registeredHandler({
 	req: { id: "t2" },
-	params: { workspaceDir: "/tmp/openclaw-token-cache-optimizer-smoke" },
+	params: { sessionId: "capture-smoke-session" },
 	client: null,
 	isWebchatConnect: () => false,
 	respond: (_ok, payload) => {
@@ -238,6 +239,7 @@ console.log("autorouter capture smoke ok")
 				)
 			}
 		},
+		sessionId: "new-agent-3-native-session",
 		workspaceDir: "/home/cloudsigma/.openclaw/workspace-new-agent-3",
 		agentDir: "/home/cloudsigma/.openclaw/workspace-new-agent-3",
 		provider: "cloudsigma",
