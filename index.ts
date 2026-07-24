@@ -75,6 +75,13 @@ function deriveSessionId(source: string): string {
 	return `${SESSION_ID_PREFIX}${hex.slice(0, 16)}`
 }
 
+const BOOT_SALT = createHash("sha256").update(`${process.pid}:${Date.now()}:${Math.random()}`).digest("hex").slice(0, 12)
+
+function deriveEphemeralSessionId(source: string): string {
+	const hex = createHash("sha256").update(`ephemeral:${BOOT_SALT}:${source}`, "utf8").digest("hex")
+	return `${SESSION_ID_PREFIX}${hex.slice(0, 16)}`
+}
+
 function resolveLocalConversationSource(ctx: { sessionId?: unknown }): string | undefined {
 	const sessionId = safeString(ctx.sessionId)
 	return sessionId ? `session:${sessionId}` : undefined
@@ -113,7 +120,7 @@ function resolveSessionId(workspaceDirFromCtx?: string, sessionIdFromCtx?: unkno
 
 	if (workspaceDirFromCtx) {
 		return {
-			sessionId: deriveSessionId(workspaceDirFromCtx),
+			sessionId: deriveEphemeralSessionId(`workspaceDir:${workspaceDirFromCtx}`),
 			source: `workspaceDir:${workspaceDirFromCtx}`,
 			sourceHint: `workspaceDir:${workspaceDirFromCtx}`,
 			localSessionScoped: false,
@@ -122,7 +129,7 @@ function resolveSessionId(workspaceDirFromCtx?: string, sessionIdFromCtx?: unkno
 
 	const activeSource = getActiveSessionSource() ?? fallbackSessionSource()
 	return {
-		sessionId: deriveSessionId(activeSource),
+		sessionId: deriveEphemeralSessionId(activeSource),
 		source: activeSource,
 		sourceHint: activeSource,
 		localSessionScoped: false,
@@ -402,13 +409,17 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 }
 
 function buildTransportTurnState(ctx: ProviderResolveTransportTurnStateContext): ProviderTransportTurnState | null {
-	const activeSource = resolveLocalConversationSource(ctx as { sessionId?: unknown }) ?? getActiveSessionSource() ?? fallbackSessionSource()
-	const sessionId = deriveSessionId(activeSource)
+	const localSource = resolveLocalConversationSource(ctx as { sessionId?: unknown })
+	if (!localSource) {
+		if (isDev) console.debug(`[taas-affinity] no ctx.sessionId; skipping X-Session-Id injection turnId=${ctx.turnId}`)
+		return null
+	}
+	const sessionId = deriveSessionId(localSource)
 	const agentId = deriveAgentIdForCapture(ctx as unknown as { agentDir?: string; workspaceDir?: string })
 	if (isDev) {
 		console.debug(
 			`[taas-affinity] resolveTransportTurnState sessionId=${sessionId} ` +
-				`source=${activeSource} turnId=${ctx.turnId} attempt=${ctx.attempt}`
+				`source=${localSource} turnId=${ctx.turnId} attempt=${ctx.attempt}`
 		)
 	}
 	return { headers: buildCorrelationHeaders({ sessionId, turnId: ctx.turnId, attempt: ctx.attempt, agentId }) }

@@ -48,8 +48,18 @@ assert.equal("sticky_key" in capturedPayload.metadata, false)
 assert.equal("requester_runtime" in capturedPayload.metadata, false)
 assert.equal("openclaw_correlation" in capturedPayload.metadata, false)
 
-const transportState = provider.resolveTransportTurnState({
+// Hardened contract: without a conversation-scoped ctx.sessionId the plugin must NOT
+// advertise any session id upstream (prevents a new session resuming a closed one).
+const transportStateNoSession = provider.resolveTransportTurnState({
 	provider: "cloudsigma",
+	modelId: "cloudsigma/test-model",
+	turnId: "turn-smoke",
+	attempt: 1,
+	transport: "stream",
+})
+assert.equal(transportStateNoSession, null)
+
+const transportState = provider.resolveTransportTurnState({ sessionId: "smoke-local-session", provider: "cloudsigma",
 	modelId: "cloudsigma/test-model",
 	turnId: "turn-smoke",
 	attempt: 1,
