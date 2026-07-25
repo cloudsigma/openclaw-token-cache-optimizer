@@ -14,6 +14,7 @@ plugin.register({
 	registerProvider(candidate) {
 		provider = candidate
 	},
+	runtime: { system: { enqueueSystemEvent: () => true, requestHeartbeat: () => {} } },
 })
 
 assert.ok(provider, "provider should be registered")
@@ -37,13 +38,14 @@ const wrapped = provider.wrapStreamFn({
 	provider: "cloudsigma",
 	modelId: "cloudsigma/test-model",
 	model: { id: "cloudsigma/test-model" },
+	sessionId: "smoke-native-session",
 })
 
 assert.equal(typeof wrapped, "function")
 await wrapped("model", { messages: [] }, {})
 
 assert.equal(capturedPayload.metadata.existing, "keep")
-assert.match(capturedPayload.metadata.session_id, /^oc:[a-f0-9]{16}$/)
+assert.equal(capturedPayload.metadata.session_id, "smoke-native-session")
 assert.equal(capturedPayload.metadata.sticky_key, capturedPayload.metadata.session_id)
 assert.equal(
 	capturedPayload.metadata.requester_runtime.source,
@@ -72,6 +74,7 @@ assert.equal(
 assert.equal("available_bridges" in capturedPayload.metadata.requester_runtime, false)
 
 const transportState = provider.resolveTransportTurnState({
+	sessionId: "smoke-local-session",
 	provider: "cloudsigma",
 	modelId: "cloudsigma/test-model",
 	turnId: "turn-smoke",
@@ -79,7 +82,7 @@ const transportState = provider.resolveTransportTurnState({
 	transport: "stream",
 })
 
-assert.match(transportState.headers["X-Session-Id"], /^oc:[a-f0-9]{16}$/)
+assert.equal(transportState.headers["X-Session-Id"], "smoke-local-session")
 
 console.log("smoke ok")
 
@@ -89,6 +92,7 @@ console.log("smoke ok")
 let registeredMethod
 let registeredHandler
 const apiWithGateway = {
+	runtime: { system: { enqueueSystemEvent: () => true, requestHeartbeat: () => {} } },
 	registerProvider(candidate) {
 		// keep previous provider too — second registration
 	},

@@ -22,7 +22,7 @@ async function loadPlugin(env: Record<string, string | undefined> = {}) {
 
 function captureProvider(plugin: any) {
 	let provider: any
-	plugin.register({ registerProvider(candidate: any) { provider = candidate } })
+	plugin.register({ registerProvider(candidate: any) { provider = candidate }, runtime: { system: { enqueueSystemEvent: () => true, requestHeartbeat: () => {} } } })
 	return provider
 }
 
@@ -50,7 +50,7 @@ test("Direction-2 metadata has no requester bridge descriptors or raw local path
 		TAAS_REQUESTER_BRIDGE_LEASE_URL: "http://127.0.0.1:9/internal/requester-bridges/leases",
 	})
 	try {
-		const payload = await runPayload(captureProvider(plugin), { messages: [], metadata: {} })
+		const payload = await runPayload(captureProvider(plugin), { messages: [], metadata: {} }, { sessionId: "local-runtime-test" })
 		const runtime = payload.metadata.requester_runtime
 		assert.equal("available_bridges" in runtime, false)
 		assert.equal("capture_mode" in runtime, false)

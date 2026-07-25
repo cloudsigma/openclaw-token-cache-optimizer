@@ -29,6 +29,7 @@ const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-06-04"
 const REQUESTER_RUNTIME_SOURCE = "openclaw-taas-affinity"
 const GIT_PROBE_TIMEOUT_MS = 250
 const LAST_ROUTE_LIMIT = 256
+const PLUGIN_VERSION = "0.6.0"
 
 // OpenClaw stores active registry state (including workspaceDir) on globalThis
 // under this well-known symbol key.
@@ -40,6 +41,10 @@ type RequesterRuntime = Record<string, unknown>
 type AutorouterCapture = {
 	sessionId: string
 	capturedAt: number
+	taasRequestId: string | null
+	taasTraceId: string | null
+	openclawTurnId: string | null
+	openclawAttempt: string | null
 	autorouterModel: string | null
 	autorouterAlgo: string | null
 	autorouterAlgoSource: string | null
@@ -62,46 +67,59 @@ function stableHash(value: string, prefix: string, length = 16): string {
 	return `${prefix}:${hex.slice(0, length)}`
 }
 
-function deriveSessionId(source: string): string {
-	const normalised = source.startsWith("env:") || source.startsWith("agent:")
-		? source
-		: path.resolve(source)
-	const hex = createHash("sha256").update(normalised, "utf8").digest("hex")
+function deriveFallbackSessionId(source: string): string {
+	const hex = createHash("sha256").update(source, "utf8").digest("hex")
 	return `${SESSION_ID_PREFIX}${hex.slice(0, 16)}`
 }
 
-function getActiveSessionSource(): string | undefined {
-	const envSessionId = process.env.OPENCLAW_SESSION_ID
-	if (envSessionId) return `env:${envSessionId}`
-
-	const envAgentId = process.env.OPENCLAW_AGENT_ID ?? process.env.OPENCLAW_RUN_ID
-	if (envAgentId) return `agent:${envAgentId}`
-
-	const state = (globalThis as Record<symbol, unknown>)[PLUGIN_REGISTRY_STATE] as
-		| { workspaceDir?: string }
-		| null
-		| undefined
-	return state?.workspaceDir
+type ResolvedSessionIdentity = {
+	sessionId: string
+	source: string
+	sourceHint: string
+	localSessionScoped: boolean
+	identityMode: "native" | "legacy_env"
 }
 
-function fallbackSessionSource(): string {
-	const stateDir = process.env.OPENCLAW_STATE_DIR ?? path.join(os.homedir(), ".openclaw")
-	return `stateDir:${stateDir}`
-}
+/**
+ * Prefer OpenClaw's native conversation identity exactly as supplied by the
+ * current provider runtime contract. Generation is retained only for older
+ * runtimes that expose OPENCLAW_SESSION_ID but do not populate ctx.sessionId.
+ *
+ * We intentionally do not derive identity from workspace, agent, run, or state
+ * paths: those scopes can outlive a conversation and accidentally join two
+ * otherwise independent sessions in TaaS.
+ */
+function resolveSessionIdentity(
+	workspaceDirFromCtx?: string,
+	sessionIdFromCtx?: unknown,
+): ResolvedSessionIdentity | null {
+	const nativeSessionId = safeString(sessionIdFromCtx)
+	const sourceHint = workspaceDirFromCtx
+		? `workspaceDir:${workspaceDirFromCtx}`
+		: `stateDir:${process.env.OPENCLAW_STATE_DIR ?? path.join(os.homedir(), ".openclaw")}`
 
-function resolveSessionId(workspaceDirFromCtx?: string): { sessionId: string; source: string } {
-	if (workspaceDirFromCtx) {
+	if (nativeSessionId) {
 		return {
-			sessionId: deriveSessionId(workspaceDirFromCtx),
-			source: `workspaceDir:${workspaceDirFromCtx}`,
+			sessionId: nativeSessionId,
+			source: "openclaw:ctx.sessionId",
+			sourceHint,
+			localSessionScoped: true,
+			identityMode: "native",
 		}
 	}
 
-	const activeSource = getActiveSessionSource() ?? fallbackSessionSource()
-	return {
-		sessionId: deriveSessionId(activeSource),
-		source: activeSource,
+	const legacySessionId = safeString(process.env.OPENCLAW_SESSION_ID)
+	if (legacySessionId) {
+		return {
+			sessionId: deriveFallbackSessionId(`legacy-env:${legacySessionId}`),
+			source: "openclaw:env.OPENCLAW_SESSION_ID",
+			sourceHint,
+			localSessionScoped: true,
+			identityMode: "legacy_env",
+		}
 	}
+
+	return null
 }
 
 function findRepoRoot(startDir?: string): string | undefined {
@@ -162,10 +180,56 @@ function deriveAgentIdForCapture(ctx: { agentDir?: string; workspaceDir?: string
 	return seg
 }
 
+function buildCorrelationMetadata(
+	sessionId: string,
+	source: string,
+	sourceHint: string,
+	ctx: ProviderWrapStreamFnContext,
+	agentId: string | null
+): Record<string, unknown> {
+	const ctxRecord = ctx as unknown as Record<string, unknown>
+	const modelRecord = asRecord(ctxRecord.model)
+	const modelId = safeString(ctxRecord.modelId) ?? safeString(modelRecord?.id)
+	const provider = safeString(ctxRecord.provider)
+	return {
+		schema_version: "2026-06-05",
+		source: REQUESTER_RUNTIME_SOURCE,
+		plugin_version: PLUGIN_VERSION,
+		session_id: sessionId,
+		sticky_key: sessionId,
+		session_source_hint: stableHash(sourceHint, "source"),
+		session_identity_scope: source === "openclaw:ctx.sessionId" ? "native_openclaw_session" : "legacy_generated_session",
+		...(agentId && { agent_id: agentId }),
+		...(provider && { provider }),
+		...(modelId && { model_id: modelId }),
+	}
+}
+
+function buildCorrelationHeaders(args: {
+	sessionId: string
+	turnId?: unknown
+	attempt?: unknown
+	agentId?: string | null
+}): Record<string, string> {
+	const headers: Record<string, string> = {
+		"X-Session-Id": args.sessionId,
+		"X-OpenClaw-Session-Id": args.sessionId,
+		"X-OpenClaw-Plugin-Version": PLUGIN_VERSION,
+	}
+	const turnId = safeString(args.turnId)
+	const attempt = args.attempt === undefined || args.attempt === null ? undefined : String(args.attempt)
+	const agentId = safeString(args.agentId)
+	if (turnId) headers["X-OpenClaw-Turn-Id"] = turnId
+	if (attempt) headers["X-OpenClaw-Attempt"] = attempt
+	if (agentId) headers["X-OpenClaw-Agent-Id"] = agentId
+	return headers
+}
+
 function buildRequesterRuntime(
 	ctx: ProviderWrapStreamFnContext,
 	sessionId: string,
-	source: string
+	source: string,
+	sourceHint: string
 ): RequesterRuntime {
 	const ctxRecord = ctx as unknown as Record<string, unknown>
 	const modelRecord = asRecord(ctxRecord.model)
@@ -185,7 +249,8 @@ function buildRequesterRuntime(
 		...(repoRoot && { git_dirty_hint: readGitDirtyHint(repoRoot) }),
 		...(provider && { provider }),
 		...(modelId && { model_id: modelId }),
-		session_source_hint: stableHash(source, "source"),
+		session_source_hint: stableHash(sourceHint, "source"),
+		session_identity_scope: source === "openclaw:ctx.sessionId" ? "native_openclaw_session" : "legacy_generated_session",
 		tool_execution: "direction_2_gateway",
 		metadata_classification: {
 			identifiers: "hashed",
@@ -199,13 +264,16 @@ function buildRequesterRuntime(
 function patchPayloadMetadata(
 	payload: Record<string, unknown>,
 	sessionId: string,
-	requesterRuntime?: RequesterRuntime
+	requesterRuntime?: RequesterRuntime,
+	correlation?: Record<string, unknown>,
+	injectAffinityMetadata = true
 ): Record<string, unknown> {
 	const existingMeta = asRecord(payload.metadata) ?? {}
-	const needsSessionId = !existingMeta.session_id
-	const needsStickyKey = !existingMeta.sticky_key
+	const needsSessionId = injectAffinityMetadata && !existingMeta.session_id
+	const needsStickyKey = injectAffinityMetadata && !existingMeta.sticky_key
 	const needsRequesterRuntime = requesterRuntime && !existingMeta.requester_runtime
-	if (!needsSessionId && !needsStickyKey && !needsRequesterRuntime) return payload
+	const needsCorrelation = correlation && !existingMeta.openclaw_correlation
+	if (!needsSessionId && !needsStickyKey && !needsRequesterRuntime && !needsCorrelation) return payload
 	return {
 		...payload,
 		metadata: {
@@ -213,6 +281,7 @@ function patchPayloadMetadata(
 			...(needsSessionId && { session_id: sessionId }),
 			...(needsStickyKey && { sticky_key: sessionId }),
 			...(needsRequesterRuntime && { requester_runtime: requesterRuntime }),
+			...(needsCorrelation && { openclaw_correlation: correlation }),
 		},
 	}
 }
@@ -258,6 +327,10 @@ function captureAutorouterFromHeaders(
 		autorouterModel: lowered["x-taas-autorouter-model"] ?? null,
 		autorouterAlgo: lowered["x-taas-autorouter-mode"] ?? null,
 		autorouterAlgoSource: lowered["x-taas-autorouter-algorithm-source"] ?? null,
+		taasRequestId: lowered["x-request-id"] ?? lowered["x-taas-request-id"] ?? null,
+		taasTraceId: lowered["x-trace-id"] ?? lowered["x-taas-trace-id"] ?? null,
+		openclawTurnId: lowered["x-openclaw-turn-id"] ?? null,
+		openclawAttempt: lowered["x-openclaw-attempt"] ?? null,
 		thinkingApplied: lowered["x-taas-thinking-applied"] ?? null,
 		routedContextWindow:
 			parsedContextWindow && Number.isFinite(parsedContextWindow) && parsedContextWindow > 0
@@ -291,11 +364,12 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 	const { streamFn } = ctx
 	if (!streamFn) return undefined
 
-	const { sessionId, source } = resolveSessionId(ctx.workspaceDir)
+	const identity = resolveSessionIdentity(ctx.workspaceDir, (ctx as { sessionId?: unknown }).sessionId)
 	const agentIdForCapture = deriveAgentIdForCapture(ctx as { agentDir?: string; workspaceDir?: string })
-	const requesterRuntime = buildRequesterRuntime(ctx, sessionId, source)
+	const requesterRuntime = identity ? buildRequesterRuntime(ctx, identity.sessionId, identity.source, identity.sourceHint) : undefined
+	const correlation = identity ? buildCorrelationMetadata(identity.sessionId, identity.source, identity.sourceHint, ctx, agentIdForCapture) : undefined
 
-	if (isDev) console.debug(`[taas-affinity] wrapStreamFn sessionId=${sessionId} source=${source}`)
+	if (isDev) console.debug(`[taas-affinity] wrapStreamFn sessionId=${identity?.sessionId ?? "none"} mode=${identity?.identityMode ?? "none"}`)
 
 	const inner = streamFn
 	return function taasAffinityStreamFn(...args: Parameters<typeof inner>) {
@@ -304,13 +378,15 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 		const onPayload: NonNullable<typeof options>["onPayload"] = async (payload, payloadModel) => {
 			const payloadRecord = asRecord(payload)
 			if (!payloadRecord) return prevOnPayload ? prevOnPayload(payload, payloadModel) : payload
-			const patched = patchPayloadMetadata(payloadRecord, sessionId, requesterRuntime)
+			const patched = identity
+				? patchPayloadMetadata(payloadRecord, identity.sessionId, requesterRuntime, correlation, true)
+				: payloadRecord
 			return prevOnPayload ? prevOnPayload(patched, payloadModel) : patched
 		}
 		const prevOnResponse = options?.onResponse
 		const onResponse: NonNullable<typeof options>["onResponse"] = async (response, responseModel) => {
 			try {
-				captureAutorouterFromHeaders(sessionId, response?.headers ?? {}, agentIdForCapture)
+				identity && captureAutorouterFromHeaders(identity.sessionId, response?.headers ?? {}, agentIdForCapture)
 			} catch (err) {
 				if (isDev) console.debug(`[taas-affinity] onResponse capture failed: ${(err as Error)?.message ?? err}`)
 			}
@@ -321,15 +397,19 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 }
 
 function buildTransportTurnState(ctx: ProviderResolveTransportTurnStateContext): ProviderTransportTurnState | null {
-	const activeSource = getActiveSessionSource() ?? fallbackSessionSource()
-	const sessionId = deriveSessionId(activeSource)
+	const identity = resolveSessionIdentity(undefined, (ctx as { sessionId?: unknown }).sessionId)
+	if (!identity) {
+		if (isDev) console.debug(`[taas-affinity] no native or legacy session identity; skipping affinity headers turnId=${ctx.turnId}`)
+		return null
+	}
+	const agentId = deriveAgentIdForCapture(ctx as unknown as { agentDir?: string; workspaceDir?: string })
 	if (isDev) {
 		console.debug(
-			`[taas-affinity] resolveTransportTurnState sessionId=${sessionId} ` +
-				`source=${activeSource} turnId=${ctx.turnId} attempt=${ctx.attempt}`
+			`[taas-affinity] resolveTransportTurnState sessionId=${identity.sessionId} ` +
+				`mode=${identity.identityMode} turnId=${ctx.turnId} attempt=${ctx.attempt}`
 		)
 	}
-	return { headers: { "X-Session-Id": sessionId } }
+	return { headers: buildCorrelationHeaders({ sessionId: identity.sessionId, turnId: ctx.turnId, attempt: ctx.attempt, agentId }) }
 }
 
 export default {
@@ -350,6 +430,35 @@ export default {
 		})
 
 		if (typeof api.registerGatewayMethod === "function") api.registerGatewayMethod(
+			"taas.completion.deliver",
+			async ({ params, respond }) => {
+				const pp = (params ?? {}) as Record<string, unknown>
+				const sessionId = safeString(pp.sessionId)
+				const operationId = safeString(pp.operationId)
+				const output = safeString(pp.output)
+				if (!sessionId || !operationId || !output) {
+					respond(false, undefined, { code: "invalid_request", message: "sessionId, operationId, and output are required" })
+					return
+				}
+				const eventText = [
+					"[Requester bridge background completion]",
+					`operation_id=${operationId}`,
+					"The exact session-bound Claude Code continuation completed. Send the following completion update to the user in normal assistant voice:",
+					output,
+				].join("\n")
+				const queued = api.runtime.system.enqueueSystemEvent(eventText, { sessionKey: sessionId })
+				if (queued) api.runtime.system.requestHeartbeat({
+					source: "other",
+					intent: "immediate",
+					reason: "taas_completion_delivery",
+					sessionKey: sessionId,
+				})
+				respond(true, { ok: Boolean(queued), sessionId, operationId })
+			},
+			{ scope: "operator.write" }
+		)
+
+		if (typeof api.registerGatewayMethod === "function") api.registerGatewayMethod(
 			"taas.autorouter.lastRoute",
 			async ({ params, respond }) => {
 				const pp = (params ?? {}) as Record<string, unknown>
@@ -367,10 +476,13 @@ export default {
 					return
 				}
 
-				const resolvedSessionId = directSessionId ?? resolveSessionId(workspaceDir).sessionId
+				const resolvedIdentity = directSessionId
+					? null
+					: resolveSessionIdentity(workspaceDir, safeString(pp.localSessionId))
+				const resolvedSessionId = directSessionId ?? resolvedIdentity?.sessionId ?? null
 				respond(true, {
 					sessionId: resolvedSessionId,
-					capture: getLastRouteForSession(resolvedSessionId),
+					capture: resolvedSessionId ? getLastRouteForSession(resolvedSessionId) : null,
 				})
 			},
 			{ scope: "operator.read" }
@@ -380,8 +492,11 @@ export default {
 	_testExports: {
 		buildRequesterRuntime,
 		patchPayloadMetadata,
-		resolveSessionId,
+		resolveSessionIdentity,
+		deriveFallbackSessionId,
 		captureAutorouterFromHeaders,
+		buildCorrelationHeaders,
+		buildCorrelationMetadata,
 		getLastRouteForAgent,
 		getLastRouteForSession,
 	},
