@@ -430,6 +430,35 @@ export default {
 		})
 
 		if (typeof api.registerGatewayMethod === "function") api.registerGatewayMethod(
+			"taas.completion.deliver",
+			async ({ params, respond }) => {
+				const pp = (params ?? {}) as Record<string, unknown>
+				const sessionId = safeString(pp.sessionId)
+				const operationId = safeString(pp.operationId)
+				const output = safeString(pp.output)
+				if (!sessionId || !operationId || !output) {
+					respond(false, undefined, { code: "invalid_request", message: "sessionId, operationId, and output are required" })
+					return
+				}
+				const eventText = [
+					"[Requester bridge background completion]",
+					`operation_id=${operationId}`,
+					"The exact session-bound Claude Code continuation completed. Send the following completion update to the user in normal assistant voice:",
+					output,
+				].join("\n")
+				const queued = api.runtime.system.enqueueSystemEvent(eventText, { sessionKey: sessionId })
+				if (queued) api.runtime.system.requestHeartbeat({
+					source: "other",
+					intent: "immediate",
+					reason: "taas_completion_delivery",
+					sessionKey: sessionId,
+				})
+				respond(true, { ok: Boolean(queued), sessionId, operationId })
+			},
+			{ scope: "operator.write" }
+		)
+
+		if (typeof api.registerGatewayMethod === "function") api.registerGatewayMethod(
 			"taas.autorouter.lastRoute",
 			async ({ params, respond }) => {
 				const pp = (params ?? {}) as Record<string, unknown>

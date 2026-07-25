@@ -22,7 +22,7 @@ async function loadPlugin(env: Record<string, string | undefined> = {}) {
 
 function captureProvider(plugin: any) {
 	let provider: any
-	plugin.register({ registerProvider(candidate: any) { provider = candidate } })
+	plugin.register({ registerProvider(candidate: any) { provider = candidate }, runtime: { system: { enqueueSystemEvent: () => true, requestHeartbeat: () => {} } } })
 	return provider
 }
 
