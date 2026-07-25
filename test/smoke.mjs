@@ -14,7 +14,6 @@ plugin.register({
 	registerProvider(candidate) {
 		provider = candidate
 	},
-	runtime: { system: { enqueueSystemEvent: () => true, requestHeartbeat: () => {} } },
 })
 
 assert.ok(provider, "provider should be registered")
@@ -38,44 +37,29 @@ const wrapped = provider.wrapStreamFn({
 	provider: "cloudsigma",
 	modelId: "cloudsigma/test-model",
 	model: { id: "cloudsigma/test-model" },
-	sessionId: "smoke-native-session",
 })
 
 assert.equal(typeof wrapped, "function")
 await wrapped("model", { messages: [] }, {})
 
 assert.equal(capturedPayload.metadata.existing, "keep")
-assert.equal(capturedPayload.metadata.session_id, "smoke-native-session")
-assert.equal(capturedPayload.metadata.sticky_key, capturedPayload.metadata.session_id)
-assert.equal(
-	capturedPayload.metadata.requester_runtime.source,
-	"openclaw-taas-affinity"
-)
-assert.equal(
-	capturedPayload.metadata.requester_runtime.session_key,
-	capturedPayload.metadata.session_id
-)
-assert.equal(
-	capturedPayload.metadata.requester_runtime.provider,
-	"cloudsigma"
-)
-assert.equal(
-	capturedPayload.metadata.requester_runtime.model_id,
-	"cloudsigma/test-model"
-)
-assert.equal(
-	capturedPayload.metadata.requester_runtime.redaction_policy,
-	"no_secrets;no_raw_local_paths;no_env_values;no_git_remotes;no_status_or_diffs;no_extra_params"
-)
-assert.equal(
-	capturedPayload.metadata.requester_runtime.tool_execution,
-	"direction_2_gateway"
-)
-assert.equal("available_bridges" in capturedPayload.metadata.requester_runtime, false)
+assert.equal("session_id" in capturedPayload.metadata, false)
+assert.equal("sticky_key" in capturedPayload.metadata, false)
+assert.equal("requester_runtime" in capturedPayload.metadata, false)
+assert.equal("openclaw_correlation" in capturedPayload.metadata, false)
 
-const transportState = provider.resolveTransportTurnState({
-	sessionId: "smoke-local-session",
+// Hardened contract: without a conversation-scoped ctx.sessionId the plugin must NOT
+// advertise any session id upstream (prevents a new session resuming a closed one).
+const transportStateNoSession = provider.resolveTransportTurnState({
 	provider: "cloudsigma",
+	modelId: "cloudsigma/test-model",
+	turnId: "turn-smoke",
+	attempt: 1,
+	transport: "stream",
+})
+assert.equal(transportStateNoSession, null)
+
+const transportState = provider.resolveTransportTurnState({ sessionId: "smoke-local-session", provider: "cloudsigma",
 	modelId: "cloudsigma/test-model",
 	turnId: "turn-smoke",
 	attempt: 1,
@@ -83,6 +67,58 @@ const transportState = provider.resolveTransportTurnState({
 })
 
 assert.equal(transportState.headers["X-Session-Id"], "smoke-local-session")
+assert.equal(transportState.headers["X-OpenClaw-Session-Id"], transportState.headers["X-Session-Id"])
+assert.equal(transportState.headers["X-OpenClaw-Plugin-Version"], "0.6.0")
+assert.equal(transportState.headers["X-OpenClaw-Turn-Id"], "turn-smoke")
+assert.equal(transportState.headers["X-OpenClaw-Attempt"], "1")
+
+const localSessionWrapped = provider.wrapStreamFn({
+	streamFn,
+	sessionId: "local-session-a",
+	workspaceDir: "/tmp/openclaw-token-cache-optimizer-smoke",
+	provider: "cloudsigma",
+	modelId: "cloudsigma/test-model",
+	model: { id: "cloudsigma/test-model" },
+})
+await localSessionWrapped("model", { messages: [] }, {})
+const localSessionA = capturedPayload.metadata.session_id
+assert.equal(localSessionA, "local-session-a")
+assert.equal(capturedPayload.metadata.sticky_key, localSessionA)
+assert.equal(capturedPayload.metadata.requester_runtime.source, "openclaw-taas-affinity")
+assert.equal(capturedPayload.metadata.requester_runtime.session_key, localSessionA)
+assert.equal(capturedPayload.metadata.requester_runtime.provider, "cloudsigma")
+assert.equal(capturedPayload.metadata.requester_runtime.model_id, "cloudsigma/test-model")
+assert.equal(capturedPayload.metadata.requester_runtime.redaction_policy, "no_secrets;no_raw_local_paths;no_env_values;no_git_remotes;no_status_or_diffs;no_extra_params")
+assert.equal(capturedPayload.metadata.requester_runtime.tool_execution, "direction_2_gateway")
+assert.equal("available_bridges" in capturedPayload.metadata.requester_runtime, false)
+assert.equal(capturedPayload.metadata.openclaw_correlation.schema_version, "2026-06-05")
+assert.equal(capturedPayload.metadata.openclaw_correlation.source, "openclaw-taas-affinity")
+assert.equal(capturedPayload.metadata.openclaw_correlation.plugin_version, "0.6.0")
+assert.equal(capturedPayload.metadata.openclaw_correlation.session_id, localSessionA)
+assert.equal(capturedPayload.metadata.openclaw_correlation.sticky_key, localSessionA)
+assert.equal(capturedPayload.metadata.openclaw_correlation.provider, "cloudsigma")
+assert.equal(capturedPayload.metadata.openclaw_correlation.model_id, "cloudsigma/test-model")
+await provider.wrapStreamFn({
+	streamFn,
+	sessionId: "local-session-b",
+	workspaceDir: "/tmp/openclaw-token-cache-optimizer-smoke",
+	provider: "cloudsigma",
+	modelId: "cloudsigma/test-model",
+	model: { id: "cloudsigma/test-model" },
+})("model", { messages: [] }, {})
+assert.notEqual(capturedPayload.metadata.session_id, localSessionA)
+assert.equal(capturedPayload.metadata.openclaw_correlation.session_identity_scope, "native_openclaw_session")
+assert.equal(capturedPayload.metadata.requester_runtime.session_identity_scope, "native_openclaw_session")
+
+const localTransportState = provider.resolveTransportTurnState({
+	provider: "cloudsigma",
+	modelId: "cloudsigma/test-model",
+	sessionId: "local-session-a",
+	turnId: "turn-local",
+	attempt: 1,
+	transport: "stream",
+})
+assert.equal(localTransportState.headers["X-Session-Id"], localSessionA)
 
 console.log("smoke ok")
 
@@ -92,7 +128,6 @@ console.log("smoke ok")
 let registeredMethod
 let registeredHandler
 const apiWithGateway = {
-	runtime: { system: { enqueueSystemEvent: () => true, requestHeartbeat: () => {} } },
 	registerProvider(candidate) {
 		// keep previous provider too — second registration
 	},
@@ -121,6 +156,8 @@ const captureStreamFn = async (_model, _context, options = {}) => {
 					"x-taas-autorouter-algorithm-source": "api_key_default",
 					"x-taas-thinking-applied": "medium",
 					"x-taas-routed-context-window": "128000",
+					"x-request-id": "taas-req-123",
+					"x-trace-id": "taas-trace-456",
 				},
 			},
 			_model
@@ -129,6 +166,7 @@ const captureStreamFn = async (_model, _context, options = {}) => {
 }
 const captureWrapped = provider.wrapStreamFn({
 	streamFn: captureStreamFn,
+	sessionId: "capture-smoke-session",
 	workspaceDir: "/tmp/openclaw-token-cache-optimizer-smoke",
 	provider: "cloudsigma",
 	modelId: "cloudsigma/auto",
@@ -141,7 +179,7 @@ let respondedOk
 let respondedPayload
 await registeredHandler({
 	req: { id: "test" },
-	params: { workspaceDir: "/tmp/openclaw-token-cache-optimizer-smoke" },
+	params: { sessionId: "capture-smoke-session" },
 	client: null,
 	isWebchatConnect: () => false,
 	respond: (ok, payload) => {
@@ -152,19 +190,21 @@ await registeredHandler({
 })
 assert.equal(respondedOk, true, "handler responded ok")
 assert.ok(respondedPayload, "payload present")
-assert.match(respondedPayload.sessionId, /^oc:[a-f0-9]{16}$/, "sessionId looks valid")
+assert.equal(respondedPayload.sessionId, "capture-smoke-session", "native sessionId preserved")
 assert.ok(respondedPayload.capture, "capture present")
 assert.equal(respondedPayload.capture.autorouterModel, "cloudsigma/gpt-5")
 assert.equal(respondedPayload.capture.autorouterAlgo, "best_fit")
 assert.equal(respondedPayload.capture.autorouterAlgoSource, "api_key_default")
 assert.equal(respondedPayload.capture.thinkingApplied, "medium")
 assert.equal(respondedPayload.capture.routedContextWindow, 128000)
+assert.equal(respondedPayload.capture.taasRequestId, "taas-req-123")
+assert.equal(respondedPayload.capture.taasTraceId, "taas-trace-456")
 
 // Non-autorouted response should NOT overwrite (we explicitly drop it)
 await captureWrapped("model", { messages: [] }, {})
 await registeredHandler({
 	req: { id: "t2" },
-	params: { workspaceDir: "/tmp/openclaw-token-cache-optimizer-smoke" },
+	params: { sessionId: "capture-smoke-session" },
 	client: null,
 	isWebchatConnect: () => false,
 	respond: (_ok, payload) => {
@@ -199,6 +239,7 @@ console.log("autorouter capture smoke ok")
 				)
 			}
 		},
+		sessionId: "new-agent-3-native-session",
 		workspaceDir: "/home/cloudsigma/.openclaw/workspace-new-agent-3",
 		agentDir: "/home/cloudsigma/.openclaw/workspace-new-agent-3",
 		provider: "cloudsigma",
