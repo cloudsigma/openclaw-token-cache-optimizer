@@ -29,7 +29,7 @@ const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-06-04"
 const REQUESTER_RUNTIME_SOURCE = "openclaw-taas-affinity"
 const GIT_PROBE_TIMEOUT_MS = 250
 const LAST_ROUTE_LIMIT = 256
-const PLUGIN_VERSION = "0.7.0"
+const PLUGIN_VERSION = "0.8.0"
 
 // OpenClaw stores active registry state (including workspaceDir) on globalThis
 // under this well-known symbol key.
@@ -77,7 +77,7 @@ type ResolvedSessionIdentity = {
 	source: string
 	sourceHint: string
 	localSessionScoped: boolean
-	identityMode: "native" | "legacy_env"
+	identityMode: "native" | "legacy_env" | "agent_scoped"
 }
 
 /**
@@ -92,6 +92,7 @@ type ResolvedSessionIdentity = {
 function resolveSessionIdentity(
 	workspaceDirFromCtx?: string,
 	sessionIdFromCtx?: unknown,
+	agentIdFromCtx?: unknown,
 ): ResolvedSessionIdentity | null {
 	const nativeSessionId = safeString(sessionIdFromCtx)
 	const sourceHint = workspaceDirFromCtx
@@ -116,6 +117,30 @@ function resolveSessionIdentity(
 			sourceHint,
 			localSessionScoped: true,
 			identityMode: "legacy_env",
+		}
+	}
+
+	// Agent-scoped fallback.
+	//
+	// OpenClaw does not include `sessionId` in the wrapStreamFn context for the
+	// openai-completions transport, so neither branch above fires and the plugin
+	// previously injected nothing at all. That lane carries all agent traffic, so
+	// TaaS minted a fresh session id per request: affinity never engaged and
+	// continuity read 0% while prompt-cache reads showed ~47% real continuation.
+	//
+	// `agentId` IS supplied and is stable for the agent conversation, which is the
+	// granularity affinity needs. Scope it per workspace so two agents sharing a
+	// name in different workspaces do not collide, and label the mode distinctly
+	// so it is never mistaken for a native session id.
+	const agentId = safeString(agentIdFromCtx)
+	if (agentId) {
+		const scope = workspaceDirFromCtx ? `:${workspaceDirFromCtx}` : ""
+		return {
+			sessionId: deriveFallbackSessionId(`agent-scope:${agentId}${scope}`),
+			source: "openclaw:ctx.agentId",
+			sourceHint,
+			localSessionScoped: true,
+			identityMode: "agent_scoped",
 		}
 	}
 
@@ -392,7 +417,11 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 	const { streamFn } = ctx
 	if (!streamFn) return undefined
 
-	const identity = resolveSessionIdentity(ctx.workspaceDir, (ctx as { sessionId?: unknown }).sessionId)
+	const identity = resolveSessionIdentity(
+		ctx.workspaceDir,
+		(ctx as { sessionId?: unknown }).sessionId,
+		(ctx as { agentId?: unknown }).agentId,
+	)
 	// Resolve agent identity from the session key when no dir/env hint exists so
 	// TaaS never falls back to minting its own per-request session id.
 	const agentIdForCapture = resolveAgentIdentity(
@@ -430,7 +459,11 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 }
 
 function buildTransportTurnState(ctx: ProviderResolveTransportTurnStateContext): ProviderTransportTurnState | null {
-	const identity = resolveSessionIdentity(undefined, (ctx as { sessionId?: unknown }).sessionId)
+	const identity = resolveSessionIdentity(
+		undefined,
+		(ctx as { sessionId?: unknown }).sessionId,
+		(ctx as { agentId?: unknown }).agentId,
+	)
 	if (!identity) {
 		if (isDev) console.debug(`[taas-affinity] no native or legacy session identity; skipping affinity headers turnId=${ctx.turnId}`)
 		return null
@@ -452,6 +485,7 @@ export default {
 	// Internal helpers exposed strictly for unit tests. Not part of the plugin
 	// contract and not used at runtime.
 	__test__: {
+		resolveSessionIdentity,
 		resolveAgentIdentity,
 		deriveAgentIdForCapture,
 		buildCorrelationMetadata,
