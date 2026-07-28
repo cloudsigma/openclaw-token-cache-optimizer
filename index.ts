@@ -29,7 +29,7 @@ const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-06-04"
 const REQUESTER_RUNTIME_SOURCE = "openclaw-taas-affinity"
 const GIT_PROBE_TIMEOUT_MS = 250
 const LAST_ROUTE_LIMIT = 256
-const PLUGIN_VERSION = "0.8.0"
+const PLUGIN_VERSION = "0.9.0"
 
 // OpenClaw stores active registry state (including workspaceDir) on globalThis
 // under this well-known symbol key.
@@ -498,14 +498,22 @@ export default {
 		"pin sessions to the same upstream slot from turn 1, maximising prompt-cache hit rates.",
 
 	register(api: OpenClawPluginApi) {
+		// The runtime supports wrapSimpleCompletionStreamFn, but the installed
+		// plugin-sdk ProviderPlugin declaration lags that optional hook. Keep the
+		// compatibility cast scoped to this registration object.
 		api.registerProvider({
 			id: "taas-affinity-hook",
 			label: "CloudSigma TaaS Token Cache Optimizer",
 			hookAliases: ["cloudsigma", "cloudsigma-staging"],
 			auth: [],
+			// Full agent/tool runs use wrapStreamFn. Internal/background/simple
+			// completions use a separate OpenClaw hook; omitting it created a
+			// second identity-less population on the same Snowcrash API key.
+			// Both surfaces must inject identical session/sticky metadata.
 			wrapStreamFn: buildWrapper,
+			wrapSimpleCompletionStreamFn: buildWrapper,
 			resolveTransportTurnState: buildTransportTurnState,
-		})
+		} as any)
 
 		if (typeof api.registerGatewayMethod === "function") api.registerGatewayMethod(
 			"taas.completion.deliver",
