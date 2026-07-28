@@ -29,7 +29,7 @@ const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-06-04"
 const REQUESTER_RUNTIME_SOURCE = "openclaw-taas-affinity"
 const GIT_PROBE_TIMEOUT_MS = 250
 const LAST_ROUTE_LIMIT = 256
-const PLUGIN_VERSION = "0.6.0"
+const PLUGIN_VERSION = "0.7.0"
 
 // OpenClaw stores active registry state (including workspaceDir) on globalThis
 // under this well-known symbol key.
@@ -178,6 +178,34 @@ function deriveAgentIdForCapture(ctx: { agentDir?: string; workspaceDir?: string
 	if (seg === "workspace") return "main"
 	if (seg.startsWith("workspace-")) return seg.slice("workspace-".length)
 	return seg
+}
+
+/**
+ * Agent identity for the correlation envelope.
+ *
+ * TaaS requires BOTH an agent id and a session id before it will trust a
+ * caller-supplied identity (`identity_present = session_present && agent_present`).
+ * When neither is usable it discards the identity and mints a fresh session per
+ * request, which silently destroys affinity and prompt-cache reuse.
+ *
+ * Directory/env derivation is best-effort and frequently unavailable, so fall
+ * back to the agent segment encoded in OpenClaw session keys
+ * (`agent:<agentId>:<scope>`) and finally to a stable literal. The value only
+ * needs to be stable for the conversation, never globally unique.
+ */
+function resolveAgentIdentity(
+	ctx: { agentDir?: string; workspaceDir?: string },
+	sessionId: string | null | undefined
+): string | null {
+	const derived = deriveAgentIdForCapture(ctx)
+	if (derived) return derived
+	const sid = safeString(sessionId)
+	if (sid) {
+		const match = /^agent:([^:]+):/.exec(sid)
+		if (match?.[1]) return match[1]
+		return "main"
+	}
+	return null
 }
 
 function buildCorrelationMetadata(
@@ -365,7 +393,12 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 	if (!streamFn) return undefined
 
 	const identity = resolveSessionIdentity(ctx.workspaceDir, (ctx as { sessionId?: unknown }).sessionId)
-	const agentIdForCapture = deriveAgentIdForCapture(ctx as { agentDir?: string; workspaceDir?: string })
+	// Resolve agent identity from the session key when no dir/env hint exists so
+	// TaaS never falls back to minting its own per-request session id.
+	const agentIdForCapture = resolveAgentIdentity(
+		ctx as { agentDir?: string; workspaceDir?: string },
+		identity?.sessionId
+	)
 	const requesterRuntime = identity ? buildRequesterRuntime(ctx, identity.sessionId, identity.source, identity.sourceHint) : undefined
 	const correlation = identity ? buildCorrelationMetadata(identity.sessionId, identity.source, identity.sourceHint, ctx, agentIdForCapture) : undefined
 
@@ -402,7 +435,10 @@ function buildTransportTurnState(ctx: ProviderResolveTransportTurnStateContext):
 		if (isDev) console.debug(`[taas-affinity] no native or legacy session identity; skipping affinity headers turnId=${ctx.turnId}`)
 		return null
 	}
-	const agentId = deriveAgentIdForCapture(ctx as unknown as { agentDir?: string; workspaceDir?: string })
+	const agentId = resolveAgentIdentity(
+		ctx as unknown as { agentDir?: string; workspaceDir?: string },
+		identity.sessionId
+	)
 	if (isDev) {
 		console.debug(
 			`[taas-affinity] resolveTransportTurnState sessionId=${identity.sessionId} ` +
@@ -413,6 +449,14 @@ function buildTransportTurnState(ctx: ProviderResolveTransportTurnStateContext):
 }
 
 export default {
+	// Internal helpers exposed strictly for unit tests. Not part of the plugin
+	// contract and not used at runtime.
+	__test__: {
+		resolveAgentIdentity,
+		deriveAgentIdForCapture,
+		buildCorrelationMetadata,
+		buildCorrelationHeaders,
+	},
 	id: "openclaw-taas-affinity",
 	name: "CloudSigma TaaS Token Cache Optimizer",
 	description:
