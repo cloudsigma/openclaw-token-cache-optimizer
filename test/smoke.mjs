@@ -68,7 +68,7 @@ const transportState = provider.resolveTransportTurnState({ sessionId: "smoke-lo
 
 assert.equal(transportState.headers["X-Session-Id"], "smoke-local-session")
 assert.equal(transportState.headers["X-OpenClaw-Session-Id"], transportState.headers["X-Session-Id"])
-assert.equal(transportState.headers["X-OpenClaw-Plugin-Version"], "0.7.0")
+assert.equal(transportState.headers["X-OpenClaw-Plugin-Version"], "0.8.0")
 assert.equal(transportState.headers["X-OpenClaw-Turn-Id"], "turn-smoke")
 assert.equal(transportState.headers["X-OpenClaw-Attempt"], "1")
 
@@ -93,7 +93,7 @@ assert.equal(capturedPayload.metadata.requester_runtime.tool_execution, "directi
 assert.equal("available_bridges" in capturedPayload.metadata.requester_runtime, false)
 assert.equal(capturedPayload.metadata.openclaw_correlation.schema_version, "2026-06-05")
 assert.equal(capturedPayload.metadata.openclaw_correlation.source, "openclaw-taas-affinity")
-assert.equal(capturedPayload.metadata.openclaw_correlation.plugin_version, "0.7.0")
+assert.equal(capturedPayload.metadata.openclaw_correlation.plugin_version, "0.8.0")
 assert.equal(capturedPayload.metadata.openclaw_correlation.session_id, localSessionA)
 assert.equal(capturedPayload.metadata.openclaw_correlation.sticky_key, localSessionA)
 assert.equal(capturedPayload.metadata.openclaw_correlation.provider, "cloudsigma")
