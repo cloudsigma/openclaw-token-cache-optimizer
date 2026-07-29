@@ -29,7 +29,7 @@ const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-06-04"
 const REQUESTER_RUNTIME_SOURCE = "openclaw-taas-affinity"
 const GIT_PROBE_TIMEOUT_MS = 250
 const LAST_ROUTE_LIMIT = 256
-const PLUGIN_VERSION = "0.9.0"
+const PLUGIN_VERSION = "0.10.0"
 
 // OpenClaw stores active registry state (including workspaceDir) on globalThis
 // under this well-known symbol key.
@@ -77,7 +77,7 @@ type ResolvedSessionIdentity = {
 	source: string
 	sourceHint: string
 	localSessionScoped: boolean
-	identityMode: "native" | "legacy_env" | "agent_scoped"
+	identityMode: "native" | "legacy_env"
 }
 
 /**
@@ -120,29 +120,12 @@ function resolveSessionIdentity(
 		}
 	}
 
-	// Agent-scoped fallback.
-	//
-	// OpenClaw does not include `sessionId` in the wrapStreamFn context for the
-	// openai-completions transport, so neither branch above fires and the plugin
-	// previously injected nothing at all. That lane carries all agent traffic, so
-	// TaaS minted a fresh session id per request: affinity never engaged and
-	// continuity read 0% while prompt-cache reads showed ~47% real continuation.
-	//
-	// `agentId` IS supplied and is stable for the agent conversation, which is the
-	// granularity affinity needs. Scope it per workspace so two agents sharing a
-	// name in different workspaces do not collide, and label the mode distinctly
-	// so it is never mistaken for a native session id.
-	const agentId = safeString(agentIdFromCtx)
-	if (agentId) {
-		const scope = workspaceDirFromCtx ? `:${workspaceDirFromCtx}` : ""
-		return {
-			sessionId: deriveFallbackSessionId(`agent-scope:${agentId}${scope}`),
-			source: "openclaw:ctx.agentId",
-			sourceHint,
-			localSessionScoped: true,
-			identityMode: "agent_scoped",
-		}
-	}
+	// Deliberately do not derive conversation identity from agentId or workspace.
+	// Those scopes outlive individual sessions and would merge unrelated chats,
+	// subprocesses, or workers onto one TaaS affinity key. Current OpenClaw runs
+	// provide the authoritative identity per invocation through options.sessionId;
+	// requests without native or explicit legacy identity remain identity-less.
+	void agentIdFromCtx
 
 	return null
 }
@@ -417,25 +400,46 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 	const { streamFn } = ctx
 	if (!streamFn) return undefined
 
-	const identity = resolveSessionIdentity(
-		ctx.workspaceDir,
-		(ctx as { sessionId?: unknown }).sessionId,
-		(ctx as { agentId?: unknown }).agentId,
-	)
-	// Resolve agent identity from the session key when no dir/env hint exists so
-	// TaaS never falls back to minting its own per-request session id.
-	const agentIdForCapture = resolveAgentIdentity(
-		ctx as { agentDir?: string; workspaceDir?: string },
-		identity?.sessionId
-	)
-	const requesterRuntime = identity ? buildRequesterRuntime(ctx, identity.sessionId, identity.source, identity.sourceHint) : undefined
-	const correlation = identity ? buildCorrelationMetadata(identity.sessionId, identity.source, identity.sourceHint, ctx, agentIdForCapture) : undefined
-
-	if (isDev) console.debug(`[taas-affinity] wrapStreamFn sessionId=${identity?.sessionId ?? "none"} mode=${identity?.identityMode ?? "none"}`)
-
 	const inner = streamFn
 	return function taasAffinityStreamFn(...args: Parameters<typeof inner>) {
 		const [model, context, options] = args
+		// The provider wrapper is created before an embedded run is bound, so the
+		// authoritative conversation identity lives on this invocation's stream
+		// options. Resolve it here rather than once at wrapper construction time.
+		// Keeping every derived value in this invocation closure also prevents two
+		// concurrent sessions sharing a provider wrapper from contaminating one
+		// another's payload metadata or response capture.
+		const identity = resolveSessionIdentity(
+			ctx.workspaceDir,
+			(options as { sessionId?: unknown } | undefined)?.sessionId ??
+				(ctx as { sessionId?: unknown }).sessionId,
+			(ctx as { agentId?: unknown }).agentId,
+		)
+		// Resolve agent identity from the session key when no dir/env hint exists so
+		// TaaS never falls back to minting its own per-request session id.
+		const agentIdForCapture = resolveAgentIdentity(
+			ctx as { agentDir?: string; workspaceDir?: string },
+			identity?.sessionId,
+		)
+		const requesterRuntime = identity
+			? buildRequesterRuntime(ctx, identity.sessionId, identity.source, identity.sourceHint)
+			: undefined
+		const correlation = identity
+			? buildCorrelationMetadata(
+					identity.sessionId,
+					identity.source,
+					identity.sourceHint,
+					ctx,
+					agentIdForCapture,
+				)
+			: undefined
+
+		if (isDev) {
+			console.debug(
+				`[taas-affinity] stream invocation sessionId=${identity?.sessionId ?? "none"} mode=${identity?.identityMode ?? "none"}`,
+			)
+		}
+
 		const prevOnPayload = options?.onPayload
 		const onPayload: NonNullable<typeof options>["onPayload"] = async (payload, payloadModel) => {
 			const payloadRecord = asRecord(payload)
