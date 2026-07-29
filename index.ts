@@ -30,7 +30,7 @@ const REQUESTER_RUNTIME_SOURCE = "openclaw-taas-affinity"
 const GIT_PROBE_TIMEOUT_MS = 250
 const LAST_ROUTE_LIMIT = 256
 const PLUGIN_VERSION = "0.11.0"
-const TRACE_BRIDGE_TTL_MS = 5 * 60 * 1000
+const TRACE_BRIDGE_TTL_MS = 30 * 60 * 1000
 const TRACE_BRIDGE_LIMIT = 1024
 
 const isDev = process.env.NODE_ENV === "development" || Boolean(process.env.OPENCLAW_DEBUG)
@@ -70,6 +70,28 @@ type TraceBridgeEntry = TraceBridgeDiagnostic & {
 	sessionId: string | null
 	ambiguous: boolean
 	expiresAt: number
+}
+
+type TraceBridgeStats = {
+	hit: number
+	miss: number
+	expired: number
+	ambiguous: number
+	directOptionsSessionId: number
+}
+
+const traceBridgeStats: TraceBridgeStats = {
+	hit: 0,
+	miss: 0,
+	expired: 0,
+	ambiguous: 0,
+	directOptionsSessionId: 0,
+}
+
+function resetTraceBridgeStats(): void {
+	for (const key of Object.keys(traceBridgeStats) as Array<keyof TraceBridgeStats>) {
+		traceBridgeStats[key] = 0
+	}
 }
 
 /**
@@ -138,13 +160,49 @@ class TraceSessionBridge {
 	}
 
 	resolve(key: string): string | undefined {
-		this.pruneExpired()
+		const now = this.now()
 		const entry = this.entries.get(key)
-		return entry && !entry.ambiguous ? entry.sessionId ?? undefined : undefined
+		if (!entry) {
+			traceBridgeStats.miss += 1
+			this.pruneExpired(now)
+			return undefined
+		}
+		if (entry.expiresAt <= now) {
+			this.entries.delete(key)
+			traceBridgeStats.expired += 1
+			this.pruneExpired(now)
+			return undefined
+		}
+		if (entry.ambiguous || !entry.sessionId) {
+			traceBridgeStats.ambiguous += 1
+			return undefined
+		}
+
+		// Successful exact correlation refreshes the handoff window. Keep the
+		// entry non-consuming so delayed retries and concurrent provider calls do
+		// not race, while moving it to the newest position for bounded eviction.
+		entry.expiresAt = now + this.ttlMs
+		this.entries.delete(key)
+		this.entries.set(key, entry)
+		traceBridgeStats.hit += 1
+		return entry.sessionId
 	}
 
-	clear(): void {
+	clear(resetStats = true): void {
 		this.entries.clear()
+		if (resetStats) resetTraceBridgeStats()
+	}
+
+	get stats(): Readonly<TraceBridgeStats> {
+		return { ...traceBridgeStats }
+	}
+
+	get ttlMsValue(): number {
+		return this.ttlMs
+	}
+
+	get limitValue(): number {
+		return this.limit
 	}
 
 	get size(): number {
@@ -576,6 +634,8 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 		const [model, context, options] = args
 		const optionRecord = options as unknown as Record<string, unknown> | undefined
 		const traceKey = traceKeyFromHeaders(optionRecord?.headers)
+		const directOptionsSessionId = safeString(optionRecord?.sessionId)
+		if (directOptionsSessionId) traceBridgeStats.directOptionsSessionId += 1
 		let resolvedIdentity: ResolvedSessionIdentity | null | undefined
 		const getIdentity = (): ResolvedSessionIdentity | null => {
 			if (resolvedIdentity) return resolvedIdentity
@@ -703,6 +763,8 @@ export default {
 		traceKeyFromHeaders,
 		recordModelCallStarted,
 		traceSessionBridge,
+		traceBridgeStats,
+		resetTraceBridgeStats,
 	},
 	id: "openclaw-taas-affinity",
 	name: "CloudSigma TaaS Token Cache Optimizer",
@@ -760,6 +822,22 @@ export default {
 		)
 
 		if (typeof api.registerGatewayMethod === "function") api.registerGatewayMethod(
+			"taas.affinity.stats",
+			async ({ respond }) => {
+				respond(true, {
+					pluginVersion: PLUGIN_VERSION,
+					bridge: {
+						ttlMs: traceSessionBridge.ttlMsValue,
+						limit: traceSessionBridge.limitValue,
+						size: traceSessionBridge.size,
+					},
+					counters: traceSessionBridge.stats,
+				})
+			},
+			{ scope: "operator.read" },
+		)
+
+		if (typeof api.registerGatewayMethod === "function") api.registerGatewayMethod(
 			"taas.autorouter.lastRoute",
 			async ({ params, respond }) => {
 				const pp = (params ?? {}) as Record<string, unknown>
@@ -806,5 +884,7 @@ export default {
 		traceKeyFromHeaders,
 		recordModelCallStarted,
 		traceSessionBridge,
+		traceBridgeStats,
+		resetTraceBridgeStats,
 	},
 }

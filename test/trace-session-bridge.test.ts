@@ -90,6 +90,7 @@ test("GPT direct options identity has precedence over context and trace bridge",
 		headers: { traceparent: traceparent(TRACE_A) },
 	}, false, { sessionId: "context-session" })
 	assert.equal(payload.metadata.session_id, "options-session")
+	assert.equal(internals.traceSessionBridge.stats.directOptionsSessionId, 1)
 })
 
 test("Kimi and another generic CloudSigma model resolve exact trace bridge identity", async () => {
@@ -213,9 +214,52 @@ test("trace bridge prunes by TTL and bounded insertion order", () => {
 	assert.equal(bridge.resolve("trace-a"), undefined)
 	assert.equal(bridge.resolve("trace-b"), "session-b")
 	assert.equal(bridge.resolve("trace-c"), "session-c")
+	// The successful resolutions above refresh the sliding TTL from `now`.
 	now += 50
 	assert.equal(bridge.resolve("trace-b"), undefined)
 	assert.equal(bridge.size, 0)
+})
+
+test("successful exact matches refresh the sliding TTL for delayed retries", () => {
+	let now = 1000
+	const Bridge = internals.TraceSessionBridge
+	const bridge = new Bridge(4, 100, () => now)
+	bridge.record("trace-a", "session-a")
+	now += 90
+	assert.equal(bridge.resolve("trace-a"), "session-a")
+	now += 90
+	assert.equal(bridge.resolve("trace-a"), "session-a")
+	now += 101
+	assert.equal(bridge.resolve("trace-a"), undefined)
+})
+
+test("bridge outcome counters are privacy-safe and classify resolutions", () => {
+	let now = 1000
+	const Bridge = internals.TraceSessionBridge
+	const bridge = new Bridge(4, 50, () => now)
+	bridge.clear()
+	bridge.record("hit-trace", "session-a")
+	assert.equal(bridge.resolve("hit-trace"), "session-a")
+	assert.equal(bridge.resolve("missing-trace"), undefined)
+	bridge.markAmbiguous("ambiguous-trace")
+	assert.equal(bridge.resolve("ambiguous-trace"), undefined)
+	bridge.record("expired-trace", "session-b")
+	now += 51
+	assert.equal(bridge.resolve("expired-trace"), undefined)
+	assert.deepEqual(bridge.stats, {
+		hit: 1,
+		miss: 1,
+		expired: 1,
+		ambiguous: 1,
+		directOptionsSessionId: 0,
+	})
+	assert.equal(JSON.stringify(bridge.stats).includes("session-a"), false)
+	assert.equal(JSON.stringify(bridge.stats).includes("trace"), false)
+})
+
+test("default bridge uses the documented 30-minute TTL and 1024-entry bound", () => {
+	assert.equal(internals.traceSessionBridge.ttlMsValue, 30 * 60 * 1000)
+	assert.equal(internals.traceSessionBridge.limitValue, 1024)
 })
 
 test("duplicate exact trace with conflicting sessions becomes ambiguous", () => {

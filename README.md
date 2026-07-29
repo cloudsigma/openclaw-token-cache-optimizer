@@ -11,7 +11,7 @@ For requests routed through the `cloudsigma` or `cloudsigma-staging` provider ID
 - resolves identity in strict order: invocation `options.sessionId`, wrapper `ctx.sessionId`, exact trace bridge, explicit legacy environment fallback
 - records authoritative `model_call_started` session identity against the exact W3C `traceId` + `spanId` exposed through public `ctx.trace`
 - resolves generic/provider calls from the matching `StreamOptions.headers.traceparent` when direct session identity is absent
-- keeps the trace bridge bounded (1,024 entries), short-lived (5 minutes), and fail-closed for malformed or ambiguous correlation
+- keeps the trace bridge bounded (1,024 entries), short-lived (30-minute sliding TTL), and fail-closed for malformed or ambiguous correlation
 - generates a stable `oc:<sha256-prefix>` only as a deprecated compatibility fallback from `OPENCLAW_SESSION_ID`
 - injects `metadata.session_id` when absent
 - injects `metadata.sticky_key` when absent
@@ -21,6 +21,7 @@ For requests routed through the `cloudsigma` or `cloudsigma-staging` provider ID
 - injects `metadata.openclaw_correlation` for request/run tracing
 - captures TaaS autorouter + request/trace response headers
 - exposes the latest route capture via gateway method `taas.autorouter.lastRoute`
+- exposes privacy-safe bridge outcome counters via `taas.affinity.stats` (hits, misses, expiries, ambiguous traces, and direct invocation IDs); no trace or session values are returned
 
 ## Startup compatibility
 
@@ -39,7 +40,7 @@ This is required because gateway RPC handlers must be attached during gateway st
 
 ## Trace bridge compatibility
 
-On OpenClaw versions that expose the public `model_call_started` lifecycle hook, the plugin feature-detects `api.on`, records an authoritative non-empty `ctx.sessionId` (while checking `event.sessionId` for consistency), and requires an exact valid W3C trace/span match in the later provider invocation. It never uses timing, agent ID, workspace, session key, or a process-global "current session" for correlation.
+On OpenClaw versions that expose the public `model_call_started` lifecycle hook, the plugin feature-detects `api.on`, records an authoritative non-empty `ctx.sessionId` (while checking `event.sessionId` for consistency), and requires an exact valid W3C trace/span match in the later provider invocation. It never uses timing, agent ID, workspace, session key, or a process-global "current session" for correlation. Exact successful matches refresh a 30-minute sliding bridge TTL so delayed retries remain safe; TaaS retains the resulting session affinity independently for seven days.
 
 Older OpenClaw versions without this hook continue to work when `options.sessionId`, wrapper `ctx.sessionId`, or the explicit legacy `OPENCLAW_SESSION_ID` is available. Calls without one of those strong identities remain affinity-less.
 

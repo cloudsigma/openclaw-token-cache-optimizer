@@ -153,3 +153,32 @@ test("no session identity means no affinity injection", async () => {
 		restore()
 	}
 })
+
+
+test("privacy-safe affinity stats gateway method exposes counters without identities", async () => {
+	const { plugin, restore } = await loadPlugin()
+	try {
+		const methods = new Map<string, any>()
+		plugin.register({
+			registerProvider() {},
+			registerGatewayMethod(name: string, handler: any) { methods.set(name, handler) },
+			runtime: { system: { enqueueSystemEvent: () => true, requestHeartbeat: () => {} } },
+		})
+		const handler = methods.get("taas.affinity.stats")
+		assert.equal(typeof handler, "function")
+		let response: any
+		await handler({ params: {}, respond(ok: boolean, payload: any) { response = { ok, payload } } })
+		assert.equal(response.ok, true)
+		assert.equal(response.payload.pluginVersion, "0.11.0")
+		assert.equal(response.payload.bridge.ttlMs, 30 * 60 * 1000)
+		assert.equal(response.payload.bridge.limit, 1024)
+		assert.deepEqual(Object.keys(response.payload.counters).sort(), [
+			"ambiguous", "directOptionsSessionId", "expired", "hit", "miss",
+		])
+		const encoded = JSON.stringify(response)
+		assert.equal(encoded.includes("traceId"), false)
+		assert.equal(encoded.includes("sessionId"), false)
+	} finally {
+		restore()
+	}
+})
