@@ -29,11 +29,10 @@ const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-06-04"
 const REQUESTER_RUNTIME_SOURCE = "openclaw-taas-affinity"
 const GIT_PROBE_TIMEOUT_MS = 250
 const LAST_ROUTE_LIMIT = 256
-const PLUGIN_VERSION = "0.10.0"
+const PLUGIN_VERSION = "0.11.0"
+const TRACE_BRIDGE_TTL_MS = 30 * 60 * 1000
+const TRACE_BRIDGE_LIMIT = 1024
 
-// OpenClaw stores active registry state (including workspaceDir) on globalThis
-// under this well-known symbol key.
-const PLUGIN_REGISTRY_STATE = Symbol.for("openclaw.pluginRegistryState")
 const isDev = process.env.NODE_ENV === "development" || Boolean(process.env.OPENCLAW_DEBUG)
 
 type RequesterRuntime = Record<string, unknown>
@@ -62,6 +61,236 @@ function safeString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
 }
 
+type TraceBridgeDiagnostic = {
+	runId?: string
+	callId?: string
+}
+
+type TraceBridgeEntry = TraceBridgeDiagnostic & {
+	sessionId: string | null
+	ambiguous: boolean
+	expiresAt: number
+}
+
+type TraceBridgeStats = {
+	hit: number
+	miss: number
+	expired: number
+	ambiguous: number
+	directOptionsSessionId: number
+}
+
+const traceBridgeStats: TraceBridgeStats = {
+	hit: 0,
+	miss: 0,
+	expired: 0,
+	ambiguous: 0,
+	directOptionsSessionId: 0,
+}
+
+function resetTraceBridgeStats(): void {
+	for (const key of Object.keys(traceBridgeStats) as Array<keyof TraceBridgeStats>) {
+		traceBridgeStats[key] = 0
+	}
+}
+
+/**
+ * Short-lived, bounded correlation between OpenClaw's public model-call hook
+ * and the later provider invocation. Entries are deliberately non-consuming:
+ * a transport may retry or invoke multiple callbacks with the same exact span.
+ */
+class TraceSessionBridge {
+	private readonly entries = new Map<string, TraceBridgeEntry>()
+	private readonly limit: number
+	private readonly ttlMs: number
+	private readonly now: () => number
+
+	constructor(
+		limit = TRACE_BRIDGE_LIMIT,
+		ttlMs = TRACE_BRIDGE_TTL_MS,
+		now: () => number = Date.now,
+	) {
+		this.limit = limit
+		this.ttlMs = ttlMs
+		this.now = now
+	}
+
+	private pruneExpired(now = this.now()): void {
+		for (const [key, entry] of this.entries) {
+			if (entry.expiresAt <= now) this.entries.delete(key)
+		}
+	}
+
+	private enforceLimit(): void {
+		while (this.entries.size > this.limit) {
+			const oldest = this.entries.keys().next().value as string | undefined
+			if (!oldest) return
+			this.entries.delete(oldest)
+		}
+	}
+
+	record(key: string, sessionId: string, diagnostic: TraceBridgeDiagnostic = {}): void {
+		const now = this.now()
+		this.pruneExpired(now)
+		const existing = this.entries.get(key)
+		const ambiguous = existing?.ambiguous === true ||
+			(Boolean(existing?.sessionId) && existing?.sessionId !== sessionId)
+		const entry: TraceBridgeEntry = {
+			sessionId: ambiguous ? null : sessionId,
+			ambiguous,
+			expiresAt: now + this.ttlMs,
+			...diagnostic,
+		}
+		this.entries.delete(key)
+		this.entries.set(key, entry)
+		this.enforceLimit()
+	}
+
+	markAmbiguous(key: string, diagnostic: TraceBridgeDiagnostic = {}): void {
+		const now = this.now()
+		this.pruneExpired(now)
+		this.entries.delete(key)
+		this.entries.set(key, {
+			sessionId: null,
+			ambiguous: true,
+			expiresAt: now + this.ttlMs,
+			...diagnostic,
+		})
+		this.enforceLimit()
+	}
+
+	resolve(key: string): string | undefined {
+		const now = this.now()
+		const entry = this.entries.get(key)
+		if (!entry) {
+			traceBridgeStats.miss += 1
+			this.pruneExpired(now)
+			return undefined
+		}
+		if (entry.expiresAt <= now) {
+			this.entries.delete(key)
+			traceBridgeStats.expired += 1
+			this.pruneExpired(now)
+			return undefined
+		}
+		if (entry.ambiguous || !entry.sessionId) {
+			traceBridgeStats.ambiguous += 1
+			return undefined
+		}
+
+		// Successful exact correlation refreshes the handoff window. Keep the
+		// entry non-consuming so delayed retries and concurrent provider calls do
+		// not race, while moving it to the newest position for bounded eviction.
+		entry.expiresAt = now + this.ttlMs
+		this.entries.delete(key)
+		this.entries.set(key, entry)
+		traceBridgeStats.hit += 1
+		return entry.sessionId
+	}
+
+	clear(resetStats = true): void {
+		this.entries.clear()
+		if (resetStats) resetTraceBridgeStats()
+	}
+
+	get stats(): Readonly<TraceBridgeStats> {
+		return { ...traceBridgeStats }
+	}
+
+	get ttlMsValue(): number {
+		return this.ttlMs
+	}
+
+	get limitValue(): number {
+		return this.limit
+	}
+
+	get size(): number {
+		this.pruneExpired()
+		return this.entries.size
+	}
+}
+
+const traceSessionBridge = new TraceSessionBridge()
+
+function isNonZeroHex(value: string): boolean {
+	return /[1-9a-f]/i.test(value)
+}
+
+function traceKeyFromContext(value: unknown): string | undefined {
+	const trace = asRecord(value)
+	const traceId = safeString(trace?.traceId)?.toLowerCase()
+	const spanId = safeString(trace?.spanId)?.toLowerCase()
+	if (!traceId || !/^[0-9a-f]{32}$/.test(traceId) || !isNonZeroHex(traceId)) return undefined
+	if (!spanId || !/^[0-9a-f]{16}$/.test(spanId) || !isNonZeroHex(spanId)) return undefined
+	return `${traceId}:${spanId}`
+}
+
+function traceKeyFromTraceparent(value: unknown): string | undefined {
+	const traceparent = safeString(value)
+	if (!traceparent) return undefined
+	// OpenClaw currently emits canonical W3C version 00. Reject extensions and
+	// malformed/future forms rather than risk a weak or ambiguous correlation.
+	const match = /^00-([0-9a-fA-F]{32})-([0-9a-fA-F]{16})-([0-9a-fA-F]{2})$/.exec(traceparent)
+	if (!match) return undefined
+	return traceKeyFromContext({ traceId: match[1], spanId: match[2] })
+}
+
+function traceKeyFromHeaders(value: unknown): string | undefined {
+	const headers = asRecord(value)
+	if (!headers) return undefined
+	let candidate: string | undefined
+	for (const [name, raw] of Object.entries(headers)) {
+		if (name.toLowerCase() !== "traceparent") continue
+		if (typeof raw !== "string") return undefined
+		const normalized = raw.trim().toLowerCase()
+		if (candidate !== undefined && candidate !== normalized) return undefined
+		candidate = normalized
+	}
+	return traceKeyFromTraceparent(candidate)
+}
+
+function recordModelCallStarted(event: unknown, ctx: unknown): void {
+	const eventRecord = asRecord(event)
+	const ctxRecord = asRecord(ctx)
+	const traceKey = traceKeyFromContext(ctxRecord?.trace)
+	if (!traceKey) return
+
+	// ctx.sessionId is the authoritative logical-session field in the public
+	// lifecycle contract. event.sessionId is checked only for consistency; it
+	// must never substitute for a missing authoritative context identity.
+	const contextSessionId = safeString(ctxRecord?.sessionId)
+	if (!contextSessionId) return
+	const eventSessionId = safeString(eventRecord?.sessionId)
+
+	const diagnostic = {
+		runId: safeString(ctxRecord?.runId) ?? safeString(eventRecord?.runId),
+		callId: safeString(eventRecord?.callId),
+	}
+	if (eventSessionId && eventSessionId !== contextSessionId) {
+		traceSessionBridge.markAmbiguous(traceKey, diagnostic)
+		return
+	}
+	traceSessionBridge.record(traceKey, contextSessionId, diagnostic)
+}
+
+function registerTraceSessionBridgeHook(api: OpenClawPluginApi): boolean {
+	const on = (api as unknown as { on?: unknown }).on
+	if (typeof on !== "function") return false
+	try {
+		;(on as (name: string, handler: (event: unknown, ctx: unknown) => void) => void).call(
+			api,
+			"model_call_started",
+			recordModelCallStarted,
+		)
+		return true
+	} catch {
+		// Older runtimes may expose api.on without this lifecycle hook. Direct
+		// options.sessionId/ctx.sessionId affinity remains fully functional.
+		return false
+	}
+}
+
 function stableHash(value: string, prefix: string, length = 16): string {
 	const hex = createHash("sha256").update(value, "utf8").digest("hex")
 	return `${prefix}:${hex.slice(0, length)}`
@@ -77,35 +306,39 @@ type ResolvedSessionIdentity = {
 	source: string
 	sourceHint: string
 	localSessionScoped: boolean
-	identityMode: "native" | "legacy_env"
+	identityMode: "native" | "trace_bridge" | "legacy_env"
 }
 
 /**
- * Prefer OpenClaw's native conversation identity exactly as supplied by the
- * current provider runtime contract. Generation is retained only for older
- * runtimes that expose OPENCLAW_SESSION_ID but do not populate ctx.sessionId.
- *
- * We intentionally do not derive identity from workspace, agent, run, or state
- * paths: those scopes can outlive a conversation and accidentally join two
- * otherwise independent sessions in TaaS.
+ * Resolve only authoritative per-conversation identities. Provider invocation
+ * options win, followed by wrapper context, exact trace/span correlation, and
+ * finally the explicit legacy environment compatibility value.
  */
 function resolveSessionIdentity(
 	workspaceDirFromCtx?: string,
+	sessionIdFromOptions?: unknown,
 	sessionIdFromCtx?: unknown,
+	sessionIdFromTrace?: unknown,
 	agentIdFromCtx?: unknown,
 ): ResolvedSessionIdentity | null {
-	const nativeSessionId = safeString(sessionIdFromCtx)
 	const sourceHint = workspaceDirFromCtx
 		? `workspaceDir:${workspaceDirFromCtx}`
 		: `stateDir:${process.env.OPENCLAW_STATE_DIR ?? path.join(os.homedir(), ".openclaw")}`
-
-	if (nativeSessionId) {
-		return {
-			sessionId: nativeSessionId,
-			source: "openclaw:ctx.sessionId",
-			sourceHint,
-			localSessionScoped: true,
-			identityMode: "native",
+	const candidates = [
+		{ value: sessionIdFromOptions, source: "openclaw:options.sessionId", identityMode: "native" as const },
+		{ value: sessionIdFromCtx, source: "openclaw:ctx.sessionId", identityMode: "native" as const },
+		{ value: sessionIdFromTrace, source: "openclaw:model_call_started.trace", identityMode: "trace_bridge" as const },
+	]
+	for (const candidate of candidates) {
+		const sessionId = safeString(candidate.value)
+		if (sessionId) {
+			return {
+				sessionId,
+				source: candidate.source,
+				sourceHint,
+				localSessionScoped: true,
+				identityMode: candidate.identityMode,
+			}
 		}
 	}
 
@@ -120,13 +353,9 @@ function resolveSessionIdentity(
 		}
 	}
 
-	// Deliberately do not derive conversation identity from agentId or workspace.
-	// Those scopes outlive individual sessions and would merge unrelated chats,
-	// subprocesses, or workers onto one TaaS affinity key. Current OpenClaw runs
-	// provide the authoritative identity per invocation through options.sessionId;
-	// requests without native or explicit legacy identity remain identity-less.
+	// Agent and workspace scopes outlive conversations and are never identity
+	// fallbacks. Keep the parameter only for compatibility with existing callers.
 	void agentIdFromCtx
-
 	return null
 }
 
@@ -234,7 +463,7 @@ function buildCorrelationMetadata(
 		session_id: sessionId,
 		sticky_key: sessionId,
 		session_source_hint: stableHash(sourceHint, "source"),
-		session_identity_scope: source === "openclaw:ctx.sessionId" ? "native_openclaw_session" : "legacy_generated_session",
+		session_identity_scope: source === "openclaw:env.OPENCLAW_SESSION_ID" ? "legacy_generated_session" : "native_openclaw_session",
 		...(agentId && { agent_id: agentId }),
 		...(provider && { provider }),
 		...(modelId && { model_id: modelId }),
@@ -286,7 +515,7 @@ function buildRequesterRuntime(
 		...(provider && { provider }),
 		...(modelId && { model_id: modelId }),
 		session_source_hint: stableHash(sourceHint, "source"),
-		session_identity_scope: source === "openclaw:ctx.sessionId" ? "native_openclaw_session" : "legacy_generated_session",
+		session_identity_scope: source === "openclaw:env.OPENCLAW_SESSION_ID" ? "legacy_generated_session" : "native_openclaw_session",
 		tool_execution: "direction_2_gateway",
 		metadata_classification: {
 			identifiers: "hashed",
@@ -380,7 +609,7 @@ function captureAutorouterFromHeaders(
 
 	if (isDev) {
 		console.debug(
-			`[taas-affinity] captured autorouter sessionId=${sessionId} ` +
+			`[taas-affinity] captured autorouter identityRef=${stableHash(sessionId, "session")} ` +
 				`model=${capture.autorouterModel} algo=${capture.autorouterAlgo} ` +
 				`source=${capture.autorouterAlgoSource} thinking=${capture.thinkingApplied} ` +
 				`ctxWindow=${capture.routedContextWindow}`
@@ -403,56 +632,88 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 	const inner = streamFn
 	return function taasAffinityStreamFn(...args: Parameters<typeof inner>) {
 		const [model, context, options] = args
-		// The provider wrapper is created before an embedded run is bound, so the
-		// authoritative conversation identity lives on this invocation's stream
-		// options. Resolve it here rather than once at wrapper construction time.
-		// Keeping every derived value in this invocation closure also prevents two
-		// concurrent sessions sharing a provider wrapper from contaminating one
-		// another's payload metadata or response capture.
-		const identity = resolveSessionIdentity(
-			ctx.workspaceDir,
-			(options as { sessionId?: unknown } | undefined)?.sessionId ??
+		const optionRecord = options as unknown as Record<string, unknown> | undefined
+		const traceKey = traceKeyFromHeaders(optionRecord?.headers)
+		const directOptionsSessionId = safeString(optionRecord?.sessionId)
+		if (directOptionsSessionId) traceBridgeStats.directOptionsSessionId += 1
+		let resolvedIdentity: ResolvedSessionIdentity | null | undefined
+		const getIdentity = (): ResolvedSessionIdentity | null => {
+			if (resolvedIdentity) return resolvedIdentity
+			const bridgeSessionId = traceKey ? traceSessionBridge.resolve(traceKey) : undefined
+			const identity = resolveSessionIdentity(
+				ctx.workspaceDir,
+				optionRecord?.sessionId,
 				(ctx as { sessionId?: unknown }).sessionId,
-			(ctx as { agentId?: unknown }).agentId,
-		)
-		// Resolve agent identity from the session key when no dir/env hint exists so
-		// TaaS never falls back to minting its own per-request session id.
-		const agentIdForCapture = resolveAgentIdentity(
-			ctx as { agentDir?: string; workspaceDir?: string },
-			identity?.sessionId,
-		)
-		const requesterRuntime = identity
-			? buildRequesterRuntime(ctx, identity.sessionId, identity.source, identity.sourceHint)
-			: undefined
-		const correlation = identity
-			? buildCorrelationMetadata(
-					identity.sessionId,
-					identity.source,
-					identity.sourceHint,
-					ctx,
-					agentIdForCapture,
-				)
-			: undefined
-
-		if (isDev) {
-			console.debug(
-				`[taas-affinity] stream invocation sessionId=${identity?.sessionId ?? "none"} mode=${identity?.identityMode ?? "none"}`,
+				bridgeSessionId,
+				(ctx as { agentId?: unknown }).agentId,
 			)
+			// Cache successful resolution in this invocation only. Leave misses
+			// uncached because model_call_started is intentionally fire-and-forget
+			// and may populate the exact trace bridge before payload construction.
+			if (identity) resolvedIdentity = identity
+			return identity
 		}
 
 		const prevOnPayload = options?.onPayload
 		const onPayload: NonNullable<typeof options>["onPayload"] = async (payload, payloadModel) => {
 			const payloadRecord = asRecord(payload)
 			if (!payloadRecord) return prevOnPayload ? prevOnPayload(payload, payloadModel) : payload
-			const patched = identity
-				? patchPayloadMetadata(payloadRecord, identity.sessionId, requesterRuntime, correlation, true)
-				: payloadRecord
+			if (
+				traceKey &&
+				!safeString(optionRecord?.sessionId) &&
+				!safeString((ctx as { sessionId?: unknown }).sessionId)
+			) {
+				// Core dispatches observational model-call hooks through a queued
+				// microtask before invoking the provider stream. Yield once so the
+				// synchronous hook handler can publish this exact trace mapping even
+				// when a transport constructs its payload immediately. This does not
+				// correlate by time: only the exact validated trace/span can resolve.
+				await Promise.resolve()
+			}
+			const identity = getIdentity()
+			if (!identity) return prevOnPayload ? prevOnPayload(payloadRecord, payloadModel) : payloadRecord
+			const agentIdForCapture = resolveAgentIdentity(
+				ctx as { agentDir?: string; workspaceDir?: string },
+				identity.sessionId,
+			)
+			const requesterRuntime = buildRequesterRuntime(
+				ctx,
+				identity.sessionId,
+				identity.source,
+				identity.sourceHint,
+			)
+			const correlation = buildCorrelationMetadata(
+				identity.sessionId,
+				identity.source,
+				identity.sourceHint,
+				ctx,
+				agentIdForCapture,
+			)
+			const patched = patchPayloadMetadata(
+				payloadRecord,
+				identity.sessionId,
+				requesterRuntime,
+				correlation,
+				true,
+			)
+			if (isDev) {
+				console.debug(
+					`[taas-affinity] stream identityRef=${stableHash(identity.sessionId, "session")} mode=${identity.identityMode}`,
+				)
+			}
 			return prevOnPayload ? prevOnPayload(patched, payloadModel) : patched
 		}
 		const prevOnResponse = options?.onResponse
 		const onResponse: NonNullable<typeof options>["onResponse"] = async (response, responseModel) => {
 			try {
-				identity && captureAutorouterFromHeaders(identity.sessionId, response?.headers ?? {}, agentIdForCapture)
+				const identity = getIdentity()
+				if (identity) {
+					const agentIdForCapture = resolveAgentIdentity(
+						ctx as { agentDir?: string; workspaceDir?: string },
+						identity.sessionId,
+					)
+					captureAutorouterFromHeaders(identity.sessionId, response?.headers ?? {}, agentIdForCapture)
+				}
 			} catch (err) {
 				if (isDev) console.debug(`[taas-affinity] onResponse capture failed: ${(err as Error)?.message ?? err}`)
 			}
@@ -466,10 +727,12 @@ function buildTransportTurnState(ctx: ProviderResolveTransportTurnStateContext):
 	const identity = resolveSessionIdentity(
 		undefined,
 		(ctx as { sessionId?: unknown }).sessionId,
+		undefined,
+		undefined,
 		(ctx as { agentId?: unknown }).agentId,
 	)
 	if (!identity) {
-		if (isDev) console.debug(`[taas-affinity] no native or legacy session identity; skipping affinity headers turnId=${ctx.turnId}`)
+		if (isDev) console.debug("[taas-affinity] no strong session identity; skipping affinity headers")
 		return null
 	}
 	const agentId = resolveAgentIdentity(
@@ -478,8 +741,8 @@ function buildTransportTurnState(ctx: ProviderResolveTransportTurnStateContext):
 	)
 	if (isDev) {
 		console.debug(
-			`[taas-affinity] resolveTransportTurnState sessionId=${identity.sessionId} ` +
-				`mode=${identity.identityMode} turnId=${ctx.turnId} attempt=${ctx.attempt}`
+			`[taas-affinity] resolveTransportTurnState identityRef=${stableHash(identity.sessionId, "session")} ` +
+				`mode=${identity.identityMode} attempt=${ctx.attempt}`
 		)
 	}
 	return { headers: buildCorrelationHeaders({ sessionId: identity.sessionId, turnId: ctx.turnId, attempt: ctx.attempt, agentId }) }
@@ -494,6 +757,14 @@ export default {
 		deriveAgentIdForCapture,
 		buildCorrelationMetadata,
 		buildCorrelationHeaders,
+		TraceSessionBridge,
+		traceKeyFromContext,
+		traceKeyFromTraceparent,
+		traceKeyFromHeaders,
+		recordModelCallStarted,
+		traceSessionBridge,
+		traceBridgeStats,
+		resetTraceBridgeStats,
 	},
 	id: "openclaw-taas-affinity",
 	name: "CloudSigma TaaS Token Cache Optimizer",
@@ -502,6 +773,8 @@ export default {
 		"pin sessions to the same upstream slot from turn 1, maximising prompt-cache hit rates.",
 
 	register(api: OpenClawPluginApi) {
+		registerTraceSessionBridgeHook(api)
+
 		// The runtime supports wrapSimpleCompletionStreamFn, but the installed
 		// plugin-sdk ProviderPlugin declaration lags that optional hook. Keep the
 		// compatibility cast scoped to this registration object.
@@ -549,6 +822,22 @@ export default {
 		)
 
 		if (typeof api.registerGatewayMethod === "function") api.registerGatewayMethod(
+			"taas.affinity.stats",
+			async ({ respond }) => {
+				respond(true, {
+					pluginVersion: PLUGIN_VERSION,
+					bridge: {
+						ttlMs: traceSessionBridge.ttlMsValue,
+						limit: traceSessionBridge.limitValue,
+						size: traceSessionBridge.size,
+					},
+					counters: traceSessionBridge.stats,
+				})
+			},
+			{ scope: "operator.read" },
+		)
+
+		if (typeof api.registerGatewayMethod === "function") api.registerGatewayMethod(
 			"taas.autorouter.lastRoute",
 			async ({ params, respond }) => {
 				const pp = (params ?? {}) as Record<string, unknown>
@@ -568,7 +857,7 @@ export default {
 
 				const resolvedIdentity = directSessionId
 					? null
-					: resolveSessionIdentity(workspaceDir, safeString(pp.localSessionId))
+					: resolveSessionIdentity(workspaceDir, safeString(pp.localSessionId), undefined, undefined, undefined)
 				const resolvedSessionId = directSessionId ?? resolvedIdentity?.sessionId ?? null
 				respond(true, {
 					sessionId: resolvedSessionId,
@@ -589,5 +878,13 @@ export default {
 		buildCorrelationMetadata,
 		getLastRouteForAgent,
 		getLastRouteForSession,
+		TraceSessionBridge,
+		traceKeyFromContext,
+		traceKeyFromTraceparent,
+		traceKeyFromHeaders,
+		recordModelCallStarted,
+		traceSessionBridge,
+		traceBridgeStats,
+		resetTraceBridgeStats,
 	},
 }

@@ -8,7 +8,10 @@ This plugin is intentionally narrow after the Claude Code Direction-2 lane updat
 
 For requests routed through the `cloudsigma` or `cloudsigma-staging` provider IDs, the plugin:
 
-- passes OpenClaw's native `ctx.sessionId` through unchanged when available
+- resolves identity in strict order: invocation `options.sessionId`, wrapper `ctx.sessionId`, exact trace bridge, explicit legacy environment fallback
+- records authoritative `model_call_started` session identity against the exact W3C `traceId` + `spanId` exposed through public `ctx.trace`
+- resolves generic/provider calls from the matching `StreamOptions.headers.traceparent` when direct session identity is absent
+- keeps the trace bridge bounded (1,024 entries), short-lived (30-minute sliding TTL), and fail-closed for malformed or ambiguous correlation
 - generates a stable `oc:<sha256-prefix>` only as a deprecated compatibility fallback from `OPENCLAW_SESSION_ID`
 - injects `metadata.session_id` when absent
 - injects `metadata.sticky_key` when absent
@@ -18,6 +21,7 @@ For requests routed through the `cloudsigma` or `cloudsigma-staging` provider ID
 - injects `metadata.openclaw_correlation` for request/run tracing
 - captures TaaS autorouter + request/trace response headers
 - exposes the latest route capture via gateway method `taas.autorouter.lastRoute`
+- exposes privacy-safe bridge outcome counters via `taas.affinity.stats` (hits, misses, expiries, ambiguous traces, and direct invocation IDs); no trace or session values are returned
 
 ## Startup compatibility
 
@@ -33,6 +37,12 @@ The manifest explicitly asks OpenClaw to import the plugin at gateway startup:
 ```
 
 This is required because gateway RPC handlers must be attached during gateway startup. Provider/lazy activation is not enough for `taas.autorouter.lastRoute` to be present in the live gateway dispatch table.
+
+## Trace bridge compatibility
+
+On OpenClaw versions that expose the public `model_call_started` lifecycle hook, the plugin feature-detects `api.on`, records an authoritative non-empty `ctx.sessionId` (while checking `event.sessionId` for consistency), and requires an exact valid W3C trace/span match in the later provider invocation. It never uses timing, agent ID, workspace, session key, or a process-global "current session" for correlation. Exact successful matches refresh a 30-minute sliding bridge TTL so delayed retries remain safe; TaaS retains the resulting session affinity independently for seven days.
+
+Older OpenClaw versions without this hook continue to work when `options.sessionId`, wrapper `ctx.sessionId`, or the explicit legacy `OPENCLAW_SESSION_ID` is available. Calls without one of those strong identities remain affinity-less.
 
 ## Request metadata
 
@@ -66,7 +76,7 @@ Example injected metadata:
     "openclaw_correlation": {
       "schema_version": "2026-06-05",
       "source": "openclaw-taas-affinity",
-      "plugin_version": "0.6.0",
+      "plugin_version": "0.11.0",
       "session_id": "oc:0123456789abcdef",
       "sticky_key": "oc:0123456789abcdef",
       "session_source_hint": "source:1a2b3c4d5e6f7890",
@@ -78,7 +88,7 @@ Example injected metadata:
 }
 ```
 
-All metadata fields are no-overwrite. If the caller already supplied `metadata.session_id`, `metadata.sticky_key`, or `metadata.requester_runtime`, the plugin leaves them intact.
+All metadata fields, including `openclaw_correlation`, are no-overwrite. If the caller already supplied `metadata.session_id`, `metadata.sticky_key`, `metadata.requester_runtime`, or `metadata.openclaw_correlation`, the plugin leaves them intact.
 
 The plugin does not include raw local paths (`workspace_dir`, `agent_dir`, `repo_root_hint`), environment variables, tokens, git remotes, full git status output, diffs, or arbitrary provider `extraParams`.
 
@@ -178,6 +188,12 @@ npm run build
 
 Current tests cover:
 
+- direct GPT invocation identity and strict precedence
+- Kimi and generic CloudSigma trace-bridge identity
+- simple-completion trace bridging
+- concurrent traces, same-trace retries, and subagent isolation
+- malformed, absent, expired, oversized, or ambiguous trace state failing closed
+- graceful operation when the lifecycle hook is unavailable
 - manifest startup activation
 - provider hook registration for `cloudsigma` and `cloudsigma-staging`
 - metadata/header injection
