@@ -12,10 +12,13 @@ test("simple completion hook is registered and shares affinity injection", async
     provider: "cloudsigma", modelId: "gpt-5.6-sol", agentId: "main",
     workspaceDir: "/home/cloudsigma/.openclaw/workspace", streamFn: inner,
   })
-  const gen = wrapped("gpt-5.6-sol", {}, { onPayload: async (p: any) => p })
+  const gen = wrapped("gpt-5.6-sol", {}, {
+    sessionId: "simple-completion-session",
+    onPayload: async (p: any) => p,
+  })
   await gen.next()
   const patched = await innerOptions.onPayload({ model: "gpt-5.6-sol", messages: [{ role: "user", content: "hi" }] }, "gpt-5.6-sol")
-  assert.ok(patched.metadata?.session_id?.startsWith("oc:"))
+  assert.equal(patched.metadata?.session_id, "simple-completion-session")
   assert.equal(patched.metadata?.sticky_key, patched.metadata?.session_id)
   assert.equal(patched.metadata?.openclaw_correlation?.agent_id, "main")
 })
