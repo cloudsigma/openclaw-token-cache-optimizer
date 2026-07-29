@@ -77,7 +77,7 @@ type ResolvedSessionIdentity = {
 	source: string
 	sourceHint: string
 	localSessionScoped: boolean
-	identityMode: "native" | "legacy_env" | "agent_scoped"
+	identityMode: "native" | "legacy_env"
 }
 
 /**
@@ -120,29 +120,12 @@ function resolveSessionIdentity(
 		}
 	}
 
-	// Agent-scoped fallback.
-	//
-	// OpenClaw does not include `sessionId` in the wrapStreamFn context for the
-	// openai-completions transport, so neither branch above fires and the plugin
-	// previously injected nothing at all. That lane carries all agent traffic, so
-	// TaaS minted a fresh session id per request: affinity never engaged and
-	// continuity read 0% while prompt-cache reads showed ~47% real continuation.
-	//
-	// `agentId` IS supplied and is stable for the agent conversation, which is the
-	// granularity affinity needs. Scope it per workspace so two agents sharing a
-	// name in different workspaces do not collide, and label the mode distinctly
-	// so it is never mistaken for a native session id.
-	const agentId = safeString(agentIdFromCtx)
-	if (agentId) {
-		const scope = workspaceDirFromCtx ? `:${workspaceDirFromCtx}` : ""
-		return {
-			sessionId: deriveFallbackSessionId(`agent-scope:${agentId}${scope}`),
-			source: "openclaw:ctx.agentId",
-			sourceHint,
-			localSessionScoped: true,
-			identityMode: "agent_scoped",
-		}
-	}
+	// Deliberately do not derive conversation identity from agentId or workspace.
+	// Those scopes outlive individual sessions and would merge unrelated chats,
+	// subprocesses, or workers onto one TaaS affinity key. Current OpenClaw runs
+	// provide the authoritative identity per invocation through options.sessionId;
+	// requests without native or explicit legacy identity remain identity-less.
+	void agentIdFromCtx
 
 	return null
 }
