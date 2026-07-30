@@ -68,7 +68,7 @@ const transportState = provider.resolveTransportTurnState({ sessionId: "smoke-lo
 
 assert.equal(transportState.headers["X-Session-Id"], "smoke-local-session")
 assert.equal(transportState.headers["X-OpenClaw-Session-Id"], transportState.headers["X-Session-Id"])
-assert.equal(transportState.headers["X-OpenClaw-Plugin-Version"], "0.11.0")
+assert.equal(transportState.headers["X-OpenClaw-Plugin-Version"], "0.12.0")
 assert.equal(transportState.headers["X-OpenClaw-Turn-Id"], "turn-smoke")
 assert.equal(transportState.headers["X-OpenClaw-Attempt"], "1")
 
@@ -93,7 +93,7 @@ assert.equal(capturedPayload.metadata.requester_runtime.tool_execution, "directi
 assert.equal("available_bridges" in capturedPayload.metadata.requester_runtime, false)
 assert.equal(capturedPayload.metadata.openclaw_correlation.schema_version, "2026-06-05")
 assert.equal(capturedPayload.metadata.openclaw_correlation.source, "openclaw-taas-affinity")
-assert.equal(capturedPayload.metadata.openclaw_correlation.plugin_version, "0.11.0")
+assert.equal(capturedPayload.metadata.openclaw_correlation.plugin_version, "0.12.0")
 assert.equal(capturedPayload.metadata.openclaw_correlation.session_id, localSessionA)
 assert.equal(capturedPayload.metadata.openclaw_correlation.sticky_key, localSessionA)
 assert.equal(capturedPayload.metadata.openclaw_correlation.provider, "cloudsigma")
@@ -127,18 +127,33 @@ console.log("smoke ok")
 // X-TaaS-* headers and that taas.autorouter.lastRoute returns them.
 let registeredMethod
 let registeredHandler
+const registeredMethods = new Map()
 const apiWithGateway = {
 	registerProvider(candidate) {
 		// keep previous provider too — second registration
 	},
 	registerGatewayMethod(name, handler) {
+		registeredMethods.set(name, handler)
 		registeredMethod = name
 		registeredHandler = handler
 	},
 }
 plugin.register(apiWithGateway)
-assert.equal(registeredMethod, "taas.autorouter.lastRoute", "gateway method registered")
-assert.equal(typeof registeredHandler, "function", "handler is a function")
+registeredHandler = registeredMethods.get("taas.autorouter.lastRoute")
+assert.equal(typeof registeredHandler, "function", "lastRoute method registered")
+
+const setAlgorithmHandler = registeredMethods.get("taas.autorouter.setAlgorithm")
+assert.equal(typeof setAlgorithmHandler, "function", "setAlgorithm method registered")
+await setAlgorithmHandler({
+	params: { sessionId: "capture-smoke-session", algorithm: "ttft" },
+	respond: (ok) => assert.equal(ok, true),
+})
+const overrideHeaders = provider.resolveTransportTurnState({
+	sessionId: "capture-smoke-session",
+	turnId: "turn-override",
+	attempt: 1,
+}).headers
+assert.equal(overrideHeaders["X-TaaS-Autorouter-Algorithm"], "ttft")
 
 // Drive the wrapper through onResponse with synthetic autorouter headers.
 const captureStreamFn = async (_model, _context, options = {}) => {
