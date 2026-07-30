@@ -21,6 +21,7 @@ For requests routed through the `cloudsigma` or `cloudsigma-staging` provider ID
 - injects `metadata.openclaw_correlation` for request/run tracing
 - captures TaaS autorouter + request/trace response headers
 - exposes the latest route capture via gateway method `taas.autorouter.lastRoute`
+- accepts a per-session request override via `taas.autorouter.setAlgorithm`
 - exposes privacy-safe bridge outcome counters via `taas.affinity.stats` (hits, misses, expiries, ambiguous traces, and direct invocation IDs); no trace or session values are returned
 
 ## Startup compatibility
@@ -76,7 +77,7 @@ Example injected metadata:
     "openclaw_correlation": {
       "schema_version": "2026-06-05",
       "source": "openclaw-taas-affinity",
-      "plugin_version": "0.11.0",
+      "plugin_version": "0.12.0",
       "session_id": "oc:0123456789abcdef",
       "sticky_key": "oc:0123456789abcdef",
       "session_source_hint": "source:1a2b3c4d5e6f7890",

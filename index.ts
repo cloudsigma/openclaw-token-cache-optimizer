@@ -29,9 +29,18 @@ const REQUESTER_RUNTIME_SCHEMA_VERSION = "2026-06-04"
 const REQUESTER_RUNTIME_SOURCE = "openclaw-taas-affinity"
 const GIT_PROBE_TIMEOUT_MS = 250
 const LAST_ROUTE_LIMIT = 256
-const PLUGIN_VERSION = "0.11.0"
+const AUTOROUTER_OVERRIDE_LIMIT = 256
+const PLUGIN_VERSION = "0.12.0"
 const TRACE_BRIDGE_TTL_MS = 30 * 60 * 1000
 const TRACE_BRIDGE_LIMIT = 1024
+const AUTOROUTER_ALGORITHMS = new Set([
+	"best_fit",
+	"price_performance",
+	"savings_curve",
+	"cost",
+	"ttft",
+	"tps",
+])
 
 const isDev = process.env.NODE_ENV === "development" || Boolean(process.env.OPENCLAW_DEBUG)
 
@@ -553,6 +562,27 @@ function patchPayloadMetadata(
 
 const lastRouteBySessionId = new Map<string, AutorouterCapture>()
 const lastRouteByAgentId = new Map<string, AutorouterCapture>()
+const autorouterAlgorithmBySessionId = new Map<string, string>()
+
+function setAutorouterAlgorithm(sessionId: string, algorithm: string | null): void {
+	autorouterAlgorithmBySessionId.delete(sessionId)
+	if (algorithm === null) return
+	autorouterAlgorithmBySessionId.set(sessionId, algorithm)
+	while (autorouterAlgorithmBySessionId.size > AUTOROUTER_OVERRIDE_LIMIT) {
+		const oldest = autorouterAlgorithmBySessionId.keys().next().value as string | undefined
+		if (!oldest) break
+		autorouterAlgorithmBySessionId.delete(oldest)
+	}
+}
+
+function getAutorouterAlgorithm(sessionId: string): string | undefined {
+	const algorithm = autorouterAlgorithmBySessionId.get(sessionId)
+	if (!algorithm) return undefined
+	// Refresh insertion order so active sessions survive bounded eviction.
+	autorouterAlgorithmBySessionId.delete(sessionId)
+	autorouterAlgorithmBySessionId.set(sessionId, algorithm)
+	return algorithm
+}
 
 function pruneLastRouteMap(): void {
 	if (lastRouteBySessionId.size > LAST_ROUTE_LIMIT) {
@@ -719,7 +749,23 @@ function buildWrapper(ctx: ProviderWrapStreamFnContext) {
 			}
 			if (prevOnResponse) await prevOnResponse(response, responseModel)
 		}
-		return inner(model, context, { ...options, onPayload, onResponse })
+		const identity = getIdentity()
+		const autorouterAlgorithm = identity
+			? getAutorouterAlgorithm(identity.sessionId)
+			: undefined
+		return inner(model, context, {
+			...options,
+			...(autorouterAlgorithm
+				? {
+					headers: {
+						...options?.headers,
+						"X-TaaS-Autorouter-Algorithm": autorouterAlgorithm,
+					},
+				}
+				: {}),
+			onPayload,
+			onResponse,
+		})
 	} as typeof inner
 }
 
@@ -745,7 +791,10 @@ function buildTransportTurnState(ctx: ProviderResolveTransportTurnStateContext):
 				`mode=${identity.identityMode} attempt=${ctx.attempt}`
 		)
 	}
-	return { headers: buildCorrelationHeaders({ sessionId: identity.sessionId, turnId: ctx.turnId, attempt: ctx.attempt, agentId }) }
+	const headers = buildCorrelationHeaders({ sessionId: identity.sessionId, turnId: ctx.turnId, attempt: ctx.attempt, agentId })
+	const autorouterAlgorithm = getAutorouterAlgorithm(identity.sessionId)
+	if (autorouterAlgorithm) headers["X-TaaS-Autorouter-Algorithm"] = autorouterAlgorithm
+	return { headers }
 }
 
 export default {
@@ -765,6 +814,9 @@ export default {
 		traceSessionBridge,
 		traceBridgeStats,
 		resetTraceBridgeStats,
+		setAutorouterAlgorithm,
+		getAutorouterAlgorithm,
+		autorouterAlgorithmBySessionId,
 	},
 	id: "openclaw-taas-affinity",
 	name: "CloudSigma TaaS Token Cache Optimizer",
@@ -838,6 +890,33 @@ export default {
 		)
 
 		if (typeof api.registerGatewayMethod === "function") api.registerGatewayMethod(
+			"taas.autorouter.setAlgorithm",
+			async ({ params, respond }) => {
+				const pp = (params ?? {}) as Record<string, unknown>
+				const sessionId = safeString(pp.sessionId)
+				if (!sessionId) {
+					respond(false, undefined, { code: "invalid_request", message: "sessionId is required" })
+					return
+				}
+				if (pp.algorithm !== null && typeof pp.algorithm !== "string") {
+					respond(false, undefined, { code: "invalid_request", message: "algorithm must be a supported algorithm or null" })
+					return
+				}
+				const algorithm = pp.algorithm === null ? null : safeString(pp.algorithm)
+				if (algorithm !== null && (!algorithm || !AUTOROUTER_ALGORITHMS.has(algorithm))) {
+					respond(false, undefined, {
+						code: "invalid_request",
+						message: "unsupported AutoRouter algorithm",
+					})
+					return
+				}
+				setAutorouterAlgorithm(sessionId, algorithm)
+				respond(true, { ok: true, sessionId, algorithm })
+			},
+			{ scope: "operator.write" },
+		)
+
+		if (typeof api.registerGatewayMethod === "function") api.registerGatewayMethod(
 			"taas.autorouter.lastRoute",
 			async ({ params, respond }) => {
 				const pp = (params ?? {}) as Record<string, unknown>
@@ -886,5 +965,8 @@ export default {
 		traceSessionBridge,
 		traceBridgeStats,
 		resetTraceBridgeStats,
+		setAutorouterAlgorithm,
+		getAutorouterAlgorithm,
+		autorouterAlgorithmBySessionId,
 	},
 }

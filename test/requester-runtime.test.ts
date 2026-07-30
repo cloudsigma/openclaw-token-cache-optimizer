@@ -169,7 +169,7 @@ test("privacy-safe affinity stats gateway method exposes counters without identi
 		let response: any
 		await handler({ params: {}, respond(ok: boolean, payload: any) { response = { ok, payload } } })
 		assert.equal(response.ok, true)
-		assert.equal(response.payload.pluginVersion, "0.11.0")
+		assert.equal(response.payload.pluginVersion, "0.12.0")
 		assert.equal(response.payload.bridge.ttlMs, 30 * 60 * 1000)
 		assert.equal(response.payload.bridge.limit, 1024)
 		assert.deepEqual(Object.keys(response.payload.counters).sort(), [
@@ -178,6 +178,43 @@ test("privacy-safe affinity stats gateway method exposes counters without identi
 		const encoded = JSON.stringify(response)
 		assert.equal(encoded.includes("traceId"), false)
 		assert.equal(encoded.includes("sessionId"), false)
+	} finally {
+		restore()
+	}
+})
+
+test("autorouter override gateway method validates, injects, clears, and stays session-scoped", async () => {
+	const { plugin, restore } = await loadPlugin()
+	try {
+		const methods = new Map<string, any>()
+		let provider: any
+		plugin.register({
+			registerProvider(candidate: any) { provider = candidate },
+			registerGatewayMethod(name: string, handler: any) { methods.set(name, handler) },
+			runtime: { system: { enqueueSystemEvent: () => true, requestHeartbeat: () => {} } },
+		})
+		const handler = methods.get("taas.autorouter.setAlgorithm")
+		const call = async (params: Record<string, unknown>) => {
+			let response: any
+			await handler({ params, respond(ok: boolean, payload: any, error: any) { response = { ok, payload, error } } })
+			return response
+		}
+
+		assert.equal((await call({ sessionId: "session-a", algorithm: "cost" })).ok, true)
+		assert.equal(
+			provider.resolveTransportTurnState({ sessionId: "session-a", turnId: "turn-a", attempt: 1 }).headers["X-TaaS-Autorouter-Algorithm"],
+			"cost",
+		)
+		assert.equal(
+			provider.resolveTransportTurnState({ sessionId: "session-b", turnId: "turn-b", attempt: 1 }).headers["X-TaaS-Autorouter-Algorithm"],
+			undefined,
+		)
+		assert.equal((await call({ sessionId: "session-a", algorithm: "parity_scoring" })).ok, false)
+		assert.equal((await call({ sessionId: "session-a", algorithm: null })).ok, true)
+		assert.equal(
+			provider.resolveTransportTurnState({ sessionId: "session-a", turnId: "turn-c", attempt: 1 }).headers["X-TaaS-Autorouter-Algorithm"],
+			undefined,
+		)
 	} finally {
 		restore()
 	}
