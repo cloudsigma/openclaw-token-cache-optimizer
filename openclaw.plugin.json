@@ -1,5 +1,6 @@
 {
 	"id": "openclaw-taas-affinity",
+	"name": "CloudSigma TaaS Legacy Affinity Optimizer",
 	"activation": {
 		"onStartup": true,
 		"onProviders": ["cloudsigma", "cloudsigma-staging"]

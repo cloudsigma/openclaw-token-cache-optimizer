@@ -42,6 +42,14 @@ const AUTOROUTER_ALGORITHMS = new Set([
 	"tps",
 ])
 
+const COEXISTENCE_WARNING = [
+	"[taas-affinity] LEGACY TOPOLOGY CONFLICT: the first-class `cloudsigma` provider plugin and",
+	"`openclaw-taas-affinity` are both enabled. OpenClaw gives the literal `cloudsigma` provider owner",
+	"precedence over this plugin's `cloudsigma` hook alias, so this legacy plugin's outbound affinity",
+	"hooks will not execute. Use @cloudsigma/openclaw-taas-provider as the sole CloudSigma plugin, or",
+	"disable the first-class provider only for a temporary legacy static-provider rollback.",
+].join(" ")
+
 const isDev = process.env.NODE_ENV === "development" || Boolean(process.env.OPENCLAW_DEBUG)
 
 type RequesterRuntime = Record<string, unknown>
@@ -68,6 +76,27 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function safeString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined
+}
+
+/**
+ * Detect the only coexistence signal exposed by the public plugin API: the
+ * first-class provider owner's plugin id is `cloudsigma`, and enabled plugin
+ * entries are available in api.config. The SDK does not expose the provider
+ * registry to plugins, so do not guess at load order or inspect internals.
+ */
+function detectFirstClassCloudsigmaOwner(config: unknown): string | null {
+	const root = asRecord(config)
+	const plugins = asRecord(root?.plugins)
+	const entries = asRecord(plugins?.entries)
+	const ownerEntry = asRecord(entries?.cloudsigma)
+	return ownerEntry && ownerEntry.enabled !== false ? COEXISTENCE_WARNING : null
+}
+
+function warnOnFirstClassCloudsigmaOwner(api: OpenClawPluginApi): boolean {
+	const warning = detectFirstClassCloudsigmaOwner(api.config)
+	if (!warning) return false
+	api.logger.warn(warning)
+	return true
 }
 
 type TraceBridgeDiagnostic = {
@@ -817,6 +846,8 @@ export default {
 		setAutorouterAlgorithm,
 		getAutorouterAlgorithm,
 		autorouterAlgorithmBySessionId,
+		detectFirstClassCloudsigmaOwner,
+		warnOnFirstClassCloudsigmaOwner,
 	},
 	id: "openclaw-taas-affinity",
 	name: "CloudSigma TaaS Token Cache Optimizer",
@@ -825,6 +856,10 @@ export default {
 		"pin sessions to the same upstream slot from turn 1, maximising prompt-cache hit rates.",
 
 	register(api: OpenClawPluginApi) {
+		// This warning cannot make alias ownership safe: provider resolution happens
+		// in OpenClaw, and a literal provider id wins over hookAliases. Stay loaded
+		// for diagnostics/gateway methods, but make the ineffective topology loud.
+		warnOnFirstClassCloudsigmaOwner(api)
 		registerTraceSessionBridgeHook(api)
 
 		// The runtime supports wrapSimpleCompletionStreamFn, but the installed
@@ -968,5 +1003,7 @@ export default {
 		setAutorouterAlgorithm,
 		getAutorouterAlgorithm,
 		autorouterAlgorithmBySessionId,
+		detectFirstClassCloudsigmaOwner,
+		warnOnFirstClassCloudsigmaOwner,
 	},
 }
