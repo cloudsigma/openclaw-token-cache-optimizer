@@ -1,6 +1,78 @@
 # openclaw-taas-affinity
 
-CloudSigma TaaS affinity provider hook for OpenClaw.
+> [!WARNING]
+> **Legacy compatibility repository. Do not use this plugin for new CloudSigma installations.**
+>
+> [`@cloudsigma/openclaw-taas-provider`](https://github.com/cloudsigma/openclaw-taas-provider) is the canonical CloudSigma TaaS integration. It owns the `cloudsigma` provider, model catalogue, onboarding/auth, transport, and session-affinity hooks. This repository remains temporarily supported only for optimizer-only installations that define `models.providers.cloudsigma` statically, such as the current Rufus topology.
+>
+> **Do not enable both plugins.** OpenClaw resolves a literal provider owner before a provider `hookAliases` match. If the first-class plugin owns `cloudsigma`, this legacy plugin may still load and observe lifecycle events, but its outbound wrapper and transport hooks do not execute. That failure mode silently removes the session metadata/headers this plugin was installed to add. This compatibility branch emits a loud startup warning when its public runtime config shows the literal `cloudsigma` plugin owner enabled; the SDK exposes no supported provider-registry inspection or conflict-rejection API, so the warning is diagnostic rather than a safe ownership override.
+
+CloudSigma TaaS affinity provider hook for legacy OpenClaw static-provider installations.
+
+## Supported topology matrix
+
+| Topology | Status | Provider owner / effective hooks | Action |
+|---|---|---|---|
+| `@cloudsigma/openclaw-taas-provider` only | **Canonical / supported** | First-class plugin owns literal `cloudsigma`; its catalogue, auth, transport, and affinity hooks execute | Use for all new installs and migrated hosts |
+| Static `models.providers.cloudsigma` + `openclaw-taas-affinity` only | **Legacy supported temporarily** | No literal plugin owner exists, so this plugin's `cloudsigma` alias hooks execute | Keep only while scheduling migration; Rufus-like topology falls here |
+| Both plugins enabled | **Unsupported conflict** | Literal `cloudsigma` owner wins; this plugin's alias hooks do not execute | Migrate immediately; do not assume two plugins compose |
+| Static provider only, no plugin | **Unsupported for affinity** | No plugin injects native session identity | Install the canonical provider |
+
+## Migrate to the canonical provider
+
+These steps intentionally keep the existing static provider catalogue in place during the first migration. Do not remove credentials or static model configuration until the canonical provider has passed canaries. **Do not migrate until the canonical package's release notes explicitly confirm native session header plus full and simple-completion payload-metadata parity.** Run the commands in one controlled change window:
+
+1. Inspect and validate the current state:
+
+   ```bash
+   openclaw plugins inspect openclaw-taas-affinity --runtime --json
+   openclaw plugins inspect cloudsigma --runtime --json
+   openclaw config get models.providers.cloudsigma --json
+   openclaw config validate
+   ```
+
+   `plugins inspect cloudsigma` may report that the plugin is absent on a legacy-only host; that is the expected starting state. Record how `CLOUDSIGMA_API_KEY` or the existing secret reference is supplied before changing anything.
+
+2. Install the canonical package, then disable this legacy plugin **before restarting the gateway**:
+
+   ```bash
+   openclaw plugins install clawhub:@cloudsigma/openclaw-taas-provider
+   openclaw plugins disable openclaw-taas-affinity
+   openclaw plugins enable cloudsigma
+   openclaw config validate
+   openclaw gateway restart --safe
+   ```
+
+   The unversioned ClawHub install records the canonical package source so routine `openclaw plugins update cloudsigma` follows later supported releases. For a staged fleet rollout, use the exact parity-capable version published in that release's notes instead.
+
+   Do not leave both enabled as a fallback. They are alternative owners, not a chain: the literal `cloudsigma` provider owner has precedence and prevents this alias hook from executing.
+
+3. Verify plugin ownership and request continuity:
+
+   ```bash
+   openclaw gateway status
+   openclaw plugins inspect cloudsigma --runtime --json
+   openclaw plugins inspect openclaw-taas-affinity --json
+   openclaw plugins doctor
+   ```
+
+   Confirm the canonical `cloudsigma` plugin is loaded, this legacy plugin is disabled, and there is no `LEGACY TOPOLOGY CONFLICT` diagnostic. Then run at least two turns in the same native OpenClaw conversation for each used path (GPT, Claude, AutoRouter, and simple/background completion where applicable). Verify TaaS receives the same explicit session identity on both turns and selects the same eligible upstream node; for Claude Code also verify native resume. A successful model response alone is insufficient because the ownership conflict can preserve inference while losing affinity.
+
+### Rollback
+
+Rollback is configuration-only. Keep the static `models.providers.cloudsigma` entry and its credential available until verification completes. If canonical-provider canaries fail:
+
+```bash
+openclaw plugins disable cloudsigma
+openclaw plugins enable openclaw-taas-affinity
+openclaw config validate
+openclaw gateway restart --safe
+openclaw gateway status
+openclaw plugins inspect openclaw-taas-affinity --runtime --json
+openclaw plugins doctor
+```
+
+After rollback, repeat a same-session two-turn check and query `taas.affinity.stats` if the legacy gateway method is available. Do not enable both plugins as a rollback mechanism.
 
 This plugin is intentionally narrow after the Claude Code Direction-2 lane update. It does **not** lease requester bridges, poll for bridge work, invoke requester-local tools, rewrite OpenAI tool payloads, or run OpenClaw maintenance sidecars.
 
@@ -147,7 +219,9 @@ openclaw gateway call taas.autorouter.lastRoute \
   --json
 ```
 
-## Install / update from checkout
+## Legacy install / update from checkout
+
+The following procedure is retained for maintainers of a temporary optimizer-only static-provider host. New or migrated hosts must use `@cloudsigma/openclaw-taas-provider` instead.
 
 ```bash
 cd /home/cloudsigma/openclaw-taas-affinity
