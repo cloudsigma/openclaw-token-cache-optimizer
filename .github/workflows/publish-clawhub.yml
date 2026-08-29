@@ -1,0 +1,44 @@
+name: Publish to ClawHub
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version to publish
+        required: true
+        default: 0.12.0
+      tags:
+        description: Comma-separated ClawHub tags
+        required: true
+        default: latest
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: clawhub-publish
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npx -y clawhub@0.21.0 package validate . --json
+      - name: Publish migration release
+        run: |
+          npx -y clawhub@0.21.0 package publish . \
+            --family code-plugin \
+            --name @cloudsigma/openclaw-token-cache-optimizer \
+            --display-name "CloudSigma Token Cache Optimizer" \
+            --version "${{ inputs.version }}" \
+            --tags "${{ inputs.tags }}" \
+            --source-repo cloudsigma/openclaw-token-cache-optimizer \
+            --source-ref "${{ github.sha }}" \
+            --source-commit "${{ github.sha }}" \
+            --json
